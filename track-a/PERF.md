@@ -5,4 +5,4 @@ Every step from the reference to your final version, each with the live-board ru
 | Step | Change | Run ID | T (s) | M (MB) | Points |
 |---|---|---|---|---|---|
 | 0 | The reference, unchanged | | 32.05 | 228 | 0 |
-| 1 | | | | | |
+| 1 | simple correct Rust version (BTreeMap, String keys, Vec per box, sort at end) | | | | |
