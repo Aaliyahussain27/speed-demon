@@ -1,8 +1,9 @@
-# Track C: performance log
 
-Every step from the reference to your final version, each with the live-board run ID that measured it. Judges check that the run IDs exist and that each change moved the way you say it did.
+# Track C: Performance Log
+
+Every optimization must have a corresponding live-board run ID.
 
 | Step | Change | Run ID | T (s) | M (MB) | Points |
 |---|---|---|---|---|---|
-| 0 | The reference, unchanged | | 14.44 | 367 | 0 |
-| 1 | | | | | |
+| 0 | Reference, unchanged | — | 14.44 | 367 | 0 |
+| 1 | Initial Rust project scaffold | — | — | — | — |
