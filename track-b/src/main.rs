@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::env;
 use std::fs::File;
 use std::io::{BufWriter, Read, Write};
@@ -16,8 +16,14 @@ enum Op {
 }
 
 enum Query {
-    Bool(Vec<Vec<u8>>, Vec<Op>),
-    Phrase(Vec<Vec<u8>>),
+    Bool {
+        terms: Vec<u32>,
+        ops: Vec<Op>,
+    },
+    Phrase {
+        terms: Vec<u32>,
+        target: Vec<u8>,
+    },
 }
 
 fn build_trans_table() -> [u8; 256] {
@@ -34,27 +40,7 @@ fn build_trans_table() -> [u8; 256] {
     table
 }
 
-fn for_each_token<'a, F>(bytes: &'a [u8], mut callback: F)
-where
-    F: FnMut(&'a [u8]),
-{
-    let mut start = None;
-    for (i, &b) in bytes.iter().enumerate() {
-        if b != b' ' {
-            if start.is_none() {
-                start = Some(i);
-            }
-        } else if let Some(s) = start {
-            callback(&bytes[s..i]);
-            start = None;
-        }
-    }
-    if let Some(s) = start {
-        callback(&bytes[s..]);
-    }
-}
-
-fn extract_queries(path: &Path) -> (Vec<Query>, HashSet<Vec<u8>>) {
+fn extract_queries(path: &Path) -> (Vec<Query>, HashMap<Vec<u8>, u32>) {
     let mut raw = Vec::new();
     File::open(path)
         .expect("Failed to open queries.txt")
@@ -62,7 +48,7 @@ fn extract_queries(path: &Path) -> (Vec<Query>, HashSet<Vec<u8>>) {
         .expect("Failed to read queries.txt");
 
     let mut queries = Vec::new();
-    let mut needed_terms = HashSet::new();
+    let mut term_to_id: HashMap<Vec<u8>, u32> = HashMap::new();
 
     for line in raw.split(|&b| b == b'\n') {
         let line = if line.ends_with(b"\r") {
@@ -84,8 +70,9 @@ fn extract_queries(path: &Path) -> (Vec<Query>, HashSet<Vec<u8>>) {
                 let mut terms = Vec::with_capacity((parts.len() + 1) / 2);
                 let mut ops = Vec::with_capacity(parts.len() / 2);
 
-                terms.push(parts[0].to_vec());
-                needed_terms.insert(parts[0].to_vec());
+                let next_id = term_to_id.len() as u32;
+                let id0 = *term_to_id.entry(parts[0].to_vec()).or_insert(next_id);
+                terms.push(id0);
 
                 let mut i = 1;
                 while i < parts.len() {
@@ -96,50 +83,71 @@ fn extract_queries(path: &Path) -> (Vec<Query>, HashSet<Vec<u8>>) {
                         _ => panic!("Unknown operator {:?}", parts[i]),
                     };
                     ops.push(op);
-                    let term = parts[i + 1].to_vec();
-                    needed_terms.insert(term.clone());
-                    terms.push(term);
+                    let next_id = term_to_id.len() as u32;
+                    let id = *term_to_id.entry(parts[i + 1].to_vec()).or_insert(next_id);
+                    terms.push(id);
                     i += 2;
                 }
-                queries.push(Query::Bool(terms, ops));
+                queries.push(Query::Bool { terms, ops });
             } else if kind == b"PHRASE" {
                 let inner = if rest.starts_with(b"\"") && rest.ends_with(b"\"") {
                     &rest[1..rest.len() - 1]
                 } else {
                     rest
                 };
-                let terms: Vec<Vec<u8>> = inner
-                    .split(|&b| b == b' ')
-                    .map(|s| {
-                        needed_terms.insert(s.to_vec());
-                        s.to_vec()
-                    })
-                    .collect();
-                queries.push(Query::Phrase(terms));
+                let words: Vec<&[u8]> = inner.split(|&b| b == b' ').collect();
+                let mut term_ids = Vec::with_capacity(words.len());
+                let mut target = Vec::new();
+                target.push(b' ');
+                for (idx, w) in words.iter().enumerate() {
+                    if idx > 0 {
+                        target.push(b' ');
+                    }
+                    target.extend_from_slice(w);
+                    let next_id = term_to_id.len() as u32;
+                    let id = *term_to_id.entry(w.to_vec()).or_insert(next_id);
+                    term_ids.push(id);
+                }
+                target.push(b' ');
+                queries.push(Query::Phrase { terms: term_ids, target });
             }
         }
     }
 
-    (queries, needed_terms)
+    (queries, term_to_id)
 }
 
 struct DocArena {
-    data: Vec<u8>,
-    offsets: Vec<(u32, u32)>,
+    chunks: Vec<Vec<u8>>,
+    offsets: Vec<(u8, u32, u32)>,
 }
 
 impl DocArena {
     #[inline(always)]
     fn get_doc(&self, id: u32) -> &[u8] {
-        let (start, end) = self.offsets[id as usize];
-        &self.data[start as usize..end as usize]
+        let (chunk_idx, start, end) = self.offsets[id as usize];
+        &self.chunks[chunk_idx as usize][start as usize..end as usize]
+    }
+}
+
+struct InvertedIndex {
+    doc_ids: Vec<u32>,
+    offsets: Vec<u32>,
+}
+
+impl InvertedIndex {
+    #[inline(always)]
+    fn get(&self, tid: u32) -> &[u32] {
+        let start = self.offsets[tid as usize] as usize;
+        let end = self.offsets[tid as usize + 1] as usize;
+        &self.doc_ids[start..end]
     }
 }
 
 fn load_corpus(
     path: &Path,
-    needed_terms: &HashSet<Vec<u8>>,
-) -> (DocArena, HashMap<Vec<u8>, Vec<u32>>) {
+    term_ids: &HashMap<Vec<u8>, u32>,
+) -> (DocArena, InvertedIndex) {
     let mut raw: Vec<u8> = Vec::with_capacity(16 * 1024 * 1024);
     File::open(path)
         .expect("Failed to open docs.txt")
@@ -153,16 +161,7 @@ fn load_corpus(
         .unwrap_or(4)
         .min(8);
 
-    // Assign each needed term a stable u32 ID — threads use a flat Vec<Vec<u32>>
-    // indexed by term_id, avoiding per-thread HashMap construction + key cloning.
-    let terms_ordered: Vec<&Vec<u8>> = needed_terms.iter().collect();
-    let n_terms = terms_ordered.len();
-    // term_ids: &[u8] → u32 (content-based lookup via Borrow<[u8]>)
-    let term_ids: HashMap<&[u8], u32> = terms_ordered
-        .iter()
-        .enumerate()
-        .map(|(i, t)| (t.as_slice(), i as u32))
-        .collect();
+    let n_terms = term_ids.len();
 
     // Find chunk boundaries at line starts so no line is split across threads
     let mut byte_starts: Vec<usize> = vec![0];
@@ -198,23 +197,18 @@ fn load_corpus(
     type ChunkResult = (Vec<u8>, Vec<(u32, u32)>, Vec<Vec<u32>>);
 
     let results: Vec<ChunkResult> = std::thread::scope(|s| {
-        // Reborrow as shared references (&T is Copy) so each move|| closure
-        // copies the fat pointer rather than trying to move the owned value.
-        let raw_ref      = &raw[..];       // &[u8]                — Copy
-        let term_ids_ref = &term_ids;      // &HashMap<&[u8], u32> — Copy
+        let raw_ref = &raw[..];
+        let term_ids_ref = term_ids;
         let mut handles = Vec::with_capacity(nthreads);
         for i in 0..nthreads {
-            // Pass byte indices (usize — Copy) and doc_id_start (u32 — Copy)
-            let start        = byte_starts[i];
-            let end          = byte_starts[i + 1];
+            let start = byte_starts[i];
+            let end = byte_starts[i + 1];
             let doc_id_start = doc_id_starts[i];
             handles.push(s.spawn(move || {
                 let chunk = &raw_ref[start..end];
-                // Flat Vec indexed by term_id — zero string allocation in hot path
                 let mut local_postings: Vec<Vec<u32>> = vec![Vec::new(); n_terms];
-                let mut arena_data: Vec<u8>       = Vec::new();
+                let mut arena_data: Vec<u8> = Vec::new();
                 let mut arena_offsets: Vec<(u32, u32)> = Vec::new();
-                let mut clean: Vec<u8>            = Vec::new();
                 let mut doc_id = doc_id_start;
 
                 for line in chunk.split(|&b| b == b'\n') {
@@ -227,30 +221,48 @@ fn load_corpus(
 
                     let text = match line.iter().position(|&b| b == b'\t') {
                         Some(t) => &line[t + 1..],
-                        None    => b"",
+                        None => b"",
                     };
-
-                    clean.clear();
-                    clean.push(b' ');
-                    for &b in text {
-                        clean.push(trans_table[b as usize]);
-                    }
-                    clean.push(b' ');
 
                     let start_offset = arena_data.len() as u32;
                     arena_data.push(b' ');
 
-                    for_each_token(&clean, |tok| {
-                        // One lookup into the shared read-only term_ids map
+                    let mut in_token = false;
+                    let mut tok_start = 0;
+
+                    for &b in text {
+                        let norm = trans_table[b as usize];
+                        if norm != b' ' {
+                            if !in_token {
+                                in_token = true;
+                                tok_start = arena_data.len();
+                            }
+                            arena_data.push(norm);
+                        } else if in_token {
+                            let tok = &arena_data[tok_start..];
+                            if let Some(&tid) = term_ids_ref.get(tok) {
+                                let postings = &mut local_postings[tid as usize];
+                                if postings.last().copied() != Some(doc_id) {
+                                    postings.push(doc_id);
+                                }
+                            }
+                            arena_data.push(b' ');
+                            in_token = false;
+                        }
+                    }
+
+                    if in_token {
+                        let tok = &arena_data[tok_start..];
                         if let Some(&tid) = term_ids_ref.get(tok) {
                             let postings = &mut local_postings[tid as usize];
                             if postings.last().copied() != Some(doc_id) {
                                 postings.push(doc_id);
                             }
                         }
-                        arena_data.extend_from_slice(tok);
                         arena_data.push(b' ');
-                    });
+                    } else if arena_data.len() as u32 == start_offset + 1 {
+                        arena_data.push(b' ');
+                    }
 
                     let end_offset = arena_data.len() as u32;
                     arena_offsets.push((start_offset, end_offset));
@@ -263,63 +275,116 @@ fn load_corpus(
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
-    // --- Merge phase ---
-    // Concat arenas (adjust offsets); concat posting lists per term_id
-    // (already sorted ascending since threads own disjoint doc_id ranges).
-    let mut merged_data: Vec<u8>           = Vec::with_capacity(32 * 1024 * 1024);
-    let mut merged_offsets: Vec<(u32, u32)> = Vec::with_capacity(250_000);
-    let mut final_postings: Vec<Vec<u32>>  = vec![Vec::new(); n_terms];
+    // Drop the large raw file buffer immediately to release memory before merge
+    drop(raw);
 
-    for (partial_data, partial_offsets, partial_postings) in results {
-        let base = merged_data.len() as u32;
-        merged_data.extend_from_slice(&partial_data);
+    // --- Merge phase into flat InvertedIndex ---
+    // 1. Calculate total postings per term across all worker chunks
+    let mut term_counts: Vec<u32> = vec![0; n_terms];
+    for (_, _, partial_postings) in &results {
+        for (tid, postings) in partial_postings.iter().enumerate() {
+            term_counts[tid] += postings.len() as u32;
+        }
+    }
+
+    // 2. Prefix sum to build offsets array of size (n_terms + 1)
+    let mut offsets: Vec<u32> = Vec::with_capacity(n_terms + 1);
+    let mut total_postings: u32 = 0;
+    offsets.push(0);
+    for &count in &term_counts {
+        total_postings += count;
+        offsets.push(total_postings);
+    }
+
+    // 3. Allocate one contiguous buffer for ALL postings
+    let mut doc_ids: Vec<u32> = vec![0; total_postings as usize];
+    let mut write_pos = offsets[..n_terms].to_vec();
+
+    // 4. Fill doc_ids and build DocArena chunks
+    let mut chunks: Vec<Vec<u8>> = Vec::with_capacity(results.len());
+    let mut arena_offsets: Vec<(u8, u32, u32)> = Vec::with_capacity(250_000);
+
+    for (chunk_idx, (partial_data, partial_offsets, partial_postings)) in results.into_iter().enumerate() {
+        let c_idx = chunk_idx as u8;
+        chunks.push(partial_data);
         for (s, e) in partial_offsets {
-            merged_offsets.push((s + base, e + base));
+            arena_offsets.push((c_idx, s, e));
         }
         for (tid, postings) in partial_postings.into_iter().enumerate() {
-            if !postings.is_empty() {
-                final_postings[tid].extend_from_slice(&postings);
+            let len = postings.len();
+            if len > 0 {
+                let wp = write_pos[tid] as usize;
+                doc_ids[wp..wp + len].copy_from_slice(&postings);
+                write_pos[tid] += len as u32;
             }
         }
     }
 
-    // Convert flat Vec back to the HashMap the rest of the code expects
-    let mut final_index: HashMap<Vec<u8>, Vec<u32>> = HashMap::with_capacity(n_terms);
-    for (tid, term) in terms_ordered.iter().enumerate() {
-        final_index.insert(
-            (*term).clone(),
-            std::mem::take(&mut final_postings[tid]),
-        );
-    }
-
     (
         DocArena {
-            data: merged_data,
-            offsets: merged_offsets,
+            chunks,
+            offsets: arena_offsets,
         },
-        final_index,
+        InvertedIndex {
+            doc_ids,
+            offsets,
+        },
     )
 }
 
+#[inline(always)]
+fn gallop(slice: &[u32], target: u32) -> usize {
+    let n = slice.len();
+    if n == 0 || slice[0] >= target {
+        return 0;
+    }
+    let mut step = 1;
+    let mut prev = 0;
+    while step < n && slice[step] < target {
+        prev = step;
+        step <<= 1;
+    }
+    let high = step.min(n);
+    let mut low = prev;
+    let mut len = high - low;
+    while len > 0 {
+        let half = len / 2;
+        let mid = low + half;
+        if slice[mid] < target {
+            low = mid + 1;
+            len -= half + 1;
+        } else {
+            len = half;
+        }
+    }
+    low
+}
 
-
-fn intersect(a: &[u32], b: &[u32], out: &mut Vec<u32>) {
+fn intersect(mut a: &[u32], mut b: &[u32], out: &mut Vec<u32>) {
     out.clear();
-    let mut i = 0;
-    let mut j = 0;
-    let na = a.len();
-    let nb = b.len();
-    while i < na && j < nb {
-        let va = a[i];
-        let vb = b[j];
+    out.reserve(a.len().min(b.len()));
+
+    while !a.is_empty() && !b.is_empty() {
+        let va = a[0];
+        let vb = b[0];
         if va == vb {
             out.push(va);
-            i += 1;
-            j += 1;
+            a = &a[1..];
+            b = &b[1..];
         } else if va < vb {
-            i += 1;
+            if a.len() > 16 * b.len() {
+                let idx = gallop(a, vb);
+                a = &a[idx..];
+            } else {
+                a = &a[1..];
+            }
         } else {
-            j += 1;
+            if b.len() > 16 * a.len() {
+                let idx = gallop(b, va);
+                b = &b[idx..];
+            } else {
+                b = &b[1..];
+            }
         }
     }
 }
@@ -353,39 +418,41 @@ fn union(a: &[u32], b: &[u32], out: &mut Vec<u32>) {
     }
 }
 
-fn difference(a: &[u32], b: &[u32], out: &mut Vec<u32>) {
+fn difference(mut a: &[u32], mut b: &[u32], out: &mut Vec<u32>) {
     out.clear();
-    let mut i = 0;
-    let mut j = 0;
-    let na = a.len();
-    let nb = b.len();
-    while i < na && j < nb {
-        let va = a[i];
-        let vb = b[j];
+    out.reserve(a.len());
+
+    while !a.is_empty() && !b.is_empty() {
+        let va = a[0];
+        let vb = b[0];
         if va == vb {
-            i += 1;
-            j += 1;
+            a = &a[1..];
+            b = &b[1..];
         } else if va < vb {
             out.push(va);
-            i += 1;
+            a = &a[1..];
         } else {
-            j += 1;
+            if b.len() > 16 * a.len() {
+                let idx = gallop(b, va);
+                b = &b[idx..];
+            } else {
+                b = &b[1..];
+            }
         }
     }
-    if i < na {
-        out.extend_from_slice(&a[i..]);
+    if !a.is_empty() {
+        out.extend_from_slice(a);
     }
 }
 
 fn run_bool<'a>(
-    index: &'a HashMap<Vec<u8>, Vec<u32>>,
-    terms: &[Vec<u8>],
+    index: &'a InvertedIndex,
+    terms: &[u32],
     ops: &[Op],
     buf_a: &'a mut Vec<u32>,
     buf_b: &'a mut Vec<u32>,
 ) -> &'a [u32] {
-    let empty = &[];
-    let first = index.get(&terms[0]).map(|v| v.as_slice()).unwrap_or(empty);
+    let first = index.get(terms[0]);
 
     if ops.is_empty() {
         return first;
@@ -396,8 +463,8 @@ fn run_bool<'a>(
 
     let mut current_in_a = true;
 
-    for (op, term) in ops.iter().zip(terms[1..].iter()) {
-        let postings = index.get(term).map(|v| v.as_slice()).unwrap_or(empty);
+    for (op, &term_id) in ops.iter().zip(terms[1..].iter()) {
+        let postings = index.get(term_id);
         match op {
             Op::And => {
                 if current_in_a {
@@ -448,7 +515,7 @@ fn run_bool<'a>(
     }
 }
 
-// Fast substring search on byte slice
+// Fast substring search on byte slice using vectorized first-byte search
 fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
     let n = needle.len();
     let h = haystack.len();
@@ -459,32 +526,37 @@ fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
         return false;
     }
     let first = needle[0];
-    let mut i = 0;
-    while i + n <= h {
-        if haystack[i] == first && &haystack[i..i + n] == needle {
-            return true;
+    let rest = &needle[1..];
+    let mut offset = 0;
+
+    while offset + n <= h {
+        let remaining = &haystack[offset..=h - n];
+        if let Some(pos) = remaining.iter().position(|&b| b == first) {
+            let match_pos = offset + pos;
+            if &haystack[match_pos + 1..match_pos + n] == rest {
+                return true;
+            }
+            offset = match_pos + 1;
+        } else {
+            break;
         }
-        i += 1;
     }
     false
 }
 
 fn run_phrase(
-    index: &HashMap<Vec<u8>, Vec<u32>>,
+    index: &InvertedIndex,
     doc_arena: &DocArena,
-    terms: &[Vec<u8>],
+    terms: &[u32],
+    target: &[u8],
     buf_a: &mut Vec<u32>,
     buf_b: &mut Vec<u32>,
     matches: &mut Vec<u32>,
 ) {
     matches.clear();
-    let empty = &[];
 
-    // Start with the rarest term to minimize candidate list immediately
-    let mut sorted_terms: Vec<&Vec<u8>> = terms.iter().collect();
-    sorted_terms.sort_by_key(|t| index.get(*t).map_or(0, |p| p.len()));
-
-    let first = index.get(sorted_terms[0]).map(|v| v.as_slice()).unwrap_or(empty);
+    // terms are pre-sorted rarest-first once after corpus indexing
+    let first = index.get(terms[0]);
     if first.is_empty() {
         return;
     }
@@ -493,8 +565,8 @@ fn run_phrase(
     buf_a.extend_from_slice(first);
     let mut current_in_a = true;
 
-    for term in &sorted_terms[1..] {
-        let postings = index.get(*term).map(|v| v.as_slice()).unwrap_or(empty);
+    for &term_id in &terms[1..] {
+        let postings = index.get(term_id);
         if current_in_a {
             if buf_a.is_empty() {
                 return;
@@ -520,18 +592,8 @@ fn run_phrase(
         return;
     }
 
-    let mut target = Vec::new();
-    target.push(b' ');
-    for (i, t) in terms.iter().enumerate() {
-        if i > 0 {
-            target.push(b' ');
-        }
-        target.extend_from_slice(t);
-    }
-    target.push(b' ');
-
     for &doc_id in candidates {
-        if contains_subslice(doc_arena.get_doc(doc_id), &target) {
+        if contains_subslice(doc_arena.get_doc(doc_id), target) {
             matches.push(doc_id);
         }
     }
@@ -575,12 +637,19 @@ fn main() {
     let out_path = Path::new(&out_dir);
 
     let t0 = std::time::Instant::now();
-    let (queries, needed_terms) = extract_queries(&data_path.join(QUERIES_FILE));
+    let (mut queries, term_to_id) = extract_queries(&data_path.join(QUERIES_FILE));
     let t_queries = t0.elapsed();
 
     let t1 = std::time::Instant::now();
-    let (doc_arena, index) = load_corpus(&data_path.join(DOCS_FILE), &needed_terms);
+    let (doc_arena, index) = load_corpus(&data_path.join(DOCS_FILE), &term_to_id);
     let t_corpus = t1.elapsed();
+
+    // Pre-sort phrase query terms by posting length (rarest first) once
+    for query in &mut queries {
+        if let Query::Phrase { terms, .. } = query {
+            terms.sort_by_key(|&t| index.get(t).len());
+        }
+    }
 
     std::fs::create_dir_all(out_path).expect("Failed to create out directory");
     let out_file = File::create(out_path.join(RESULTS_FILE)).expect("Failed to create results.txt");
@@ -595,15 +664,15 @@ fn main() {
 
     for query in &queries {
         match query {
-            Query::Bool(terms, ops) => {
+            Query::Bool { terms, ops } => {
                 let q_start = std::time::Instant::now();
                 let res = run_bool(&index, terms, ops, &mut buf_a, &mut buf_b);
                 bool_dur += q_start.elapsed();
                 format_result(&mut writer, res);
             }
-            Query::Phrase(terms) => {
+            Query::Phrase { terms, target } => {
                 let q_start = std::time::Instant::now();
-                run_phrase(&index, &doc_arena, terms, &mut buf_a, &mut buf_b, &mut phrase_matches);
+                run_phrase(&index, &doc_arena, terms, target, &mut buf_a, &mut buf_b, &mut phrase_matches);
                 phrase_dur += q_start.elapsed();
                 format_result(&mut writer, &phrase_matches);
             }
