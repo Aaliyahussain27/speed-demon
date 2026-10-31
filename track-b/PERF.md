@@ -10,7 +10,8 @@ Every step from the reference to the final version, with measurements recorded d
 | 3 | Migrated to Rust (zero-dependency, sorted `Vec<u32>` postings, LTO) | `local-docker-check` (local) | 2.08 (including container startup) | — | — |
 | 4 | Parallel corpus indexing, contiguous document arena, reusable query buffers, two-pointer Boolean operations and rarest-term-first phrase matching | `run-735799f96a91` | 4.649 | 746 | 25.905 |
 | 5 | Term-ID-indexed postings, precomputed phrase targets, chunk-based document arenas, early release of raw corpus buffer and adaptive galloping intersection | `run-1185a0a27fc8` | 4.626 | 666 | 26.495 |
+| 6 | Further indexing and query-execution optimizations | `run-71d297385a7f` | 3.485 | 687 | 29.238 |
 
-**Latest official board commit:** `9e9fd91`
+**Latest official board commit:** `1462f0b`
 
 *Local measurements are development benchmarks, not official board results. The 30 MB previously listed for Step 3 was Docker image size, not peak memory.*

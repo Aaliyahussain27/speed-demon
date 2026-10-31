@@ -130,10 +130,24 @@ impl DocArena {
     }
 }
 
+struct InvertedIndex {
+    doc_ids: Vec<u32>,
+    offsets: Vec<u32>,
+}
+
+impl InvertedIndex {
+    #[inline(always)]
+    fn get(&self, tid: u32) -> &[u32] {
+        let start = self.offsets[tid as usize] as usize;
+        let end = self.offsets[tid as usize + 1] as usize;
+        &self.doc_ids[start..end]
+    }
+}
+
 fn load_corpus(
     path: &Path,
     term_ids: &HashMap<Vec<u8>, u32>,
-) -> (DocArena, Vec<Vec<u32>>) {
+) -> (DocArena, InvertedIndex) {
     let mut raw: Vec<u8> = Vec::with_capacity(16 * 1024 * 1024);
     File::open(path)
         .expect("Failed to open docs.txt")
@@ -264,20 +278,44 @@ fn load_corpus(
     // Drop the large raw file buffer immediately to release memory before merge
     drop(raw);
 
-    // --- Merge phase ---
+    // --- Merge phase into flat InvertedIndex ---
+    // 1. Calculate total postings per term across all worker chunks
+    let mut term_counts: Vec<u32> = vec![0; n_terms];
+    for (_, _, partial_postings) in &results {
+        for (tid, postings) in partial_postings.iter().enumerate() {
+            term_counts[tid] += postings.len() as u32;
+        }
+    }
+
+    // 2. Prefix sum to build offsets array of size (n_terms + 1)
+    let mut offsets: Vec<u32> = Vec::with_capacity(n_terms + 1);
+    let mut total_postings: u32 = 0;
+    offsets.push(0);
+    for &count in &term_counts {
+        total_postings += count;
+        offsets.push(total_postings);
+    }
+
+    // 3. Allocate one contiguous buffer for ALL postings
+    let mut doc_ids: Vec<u32> = vec![0; total_postings as usize];
+    let mut write_pos = offsets[..n_terms].to_vec();
+
+    // 4. Fill doc_ids and build DocArena chunks
     let mut chunks: Vec<Vec<u8>> = Vec::with_capacity(results.len());
-    let mut offsets: Vec<(u8, u32, u32)> = Vec::with_capacity(250_000);
-    let mut final_postings: Vec<Vec<u32>> = vec![Vec::new(); n_terms];
+    let mut arena_offsets: Vec<(u8, u32, u32)> = Vec::with_capacity(250_000);
 
     for (chunk_idx, (partial_data, partial_offsets, partial_postings)) in results.into_iter().enumerate() {
         let c_idx = chunk_idx as u8;
         chunks.push(partial_data);
         for (s, e) in partial_offsets {
-            offsets.push((c_idx, s, e));
+            arena_offsets.push((c_idx, s, e));
         }
         for (tid, postings) in partial_postings.into_iter().enumerate() {
-            if !postings.is_empty() {
-                final_postings[tid].extend_from_slice(&postings);
+            let len = postings.len();
+            if len > 0 {
+                let wp = write_pos[tid] as usize;
+                doc_ids[wp..wp + len].copy_from_slice(&postings);
+                write_pos[tid] += len as u32;
             }
         }
     }
@@ -285,9 +323,12 @@ fn load_corpus(
     (
         DocArena {
             chunks,
+            offsets: arena_offsets,
+        },
+        InvertedIndex {
+            doc_ids,
             offsets,
         },
-        final_postings,
     )
 }
 
@@ -405,13 +446,13 @@ fn difference(mut a: &[u32], mut b: &[u32], out: &mut Vec<u32>) {
 }
 
 fn run_bool<'a>(
-    index: &'a [Vec<u32>],
+    index: &'a InvertedIndex,
     terms: &[u32],
     ops: &[Op],
     buf_a: &'a mut Vec<u32>,
     buf_b: &'a mut Vec<u32>,
 ) -> &'a [u32] {
-    let first = &index[terms[0] as usize];
+    let first = index.get(terms[0]);
 
     if ops.is_empty() {
         return first;
@@ -423,7 +464,7 @@ fn run_bool<'a>(
     let mut current_in_a = true;
 
     for (op, &term_id) in ops.iter().zip(terms[1..].iter()) {
-        let postings = &index[term_id as usize];
+        let postings = index.get(term_id);
         match op {
             Op::And => {
                 if current_in_a {
@@ -504,7 +545,7 @@ fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
 }
 
 fn run_phrase(
-    index: &[Vec<u32>],
+    index: &InvertedIndex,
     doc_arena: &DocArena,
     terms: &[u32],
     target: &[u8],
@@ -515,7 +556,7 @@ fn run_phrase(
     matches.clear();
 
     // terms are pre-sorted rarest-first once after corpus indexing
-    let first = &index[terms[0] as usize];
+    let first = index.get(terms[0]);
     if first.is_empty() {
         return;
     }
@@ -525,7 +566,7 @@ fn run_phrase(
     let mut current_in_a = true;
 
     for &term_id in &terms[1..] {
-        let postings = &index[term_id as usize];
+        let postings = index.get(term_id);
         if current_in_a {
             if buf_a.is_empty() {
                 return;
@@ -606,7 +647,7 @@ fn main() {
     // Pre-sort phrase query terms by posting length (rarest first) once
     for query in &mut queries {
         if let Query::Phrase { terms, .. } = query {
-            terms.sort_by_key(|&t| index[t as usize].len());
+            terms.sort_by_key(|&t| index.get(t).len());
         }
     }
 
