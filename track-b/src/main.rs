@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::env;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::fs::File;
 use std::io::{BufWriter, Read, Write};
 use std::path::Path;
@@ -8,679 +9,509 @@ const DOCS_FILE: &str = "docs.txt";
 const QUERIES_FILE: &str = "queries.txt";
 const RESULTS_FILE: &str = "results.txt";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Op {
-    And,
-    Or,
-    Not,
+#[derive(Default, Clone, Copy)]
+struct FastHasher { h: u64 }
+
+const MIX_K: u64 = 0x9E37_79B9_7F4A_7C15;
+
+impl FastHasher {
+    #[inline(always)]
+    fn add(&mut self, w: u64) {
+        self.h = (self.h.rotate_left(5) ^ w).wrapping_mul(MIX_K);
+    }
 }
 
-enum Query {
-    Bool {
-        terms: Vec<u32>,
-        ops: Vec<Op>,
-    },
-    Phrase {
-        terms: Vec<u32>,
-        target: Vec<u8>,
-    },
+impl Hasher for FastHasher {
+    #[inline(always)]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut b = bytes;
+        while b.len() >= 8 {
+            self.add(u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]));
+            b = &b[8..];
+        }
+        if !b.is_empty() {
+            let mut buf = [0u8; 8];
+            buf[..b.len()].copy_from_slice(b);
+            self.add(u64::from_le_bytes(buf));
+        }
+    }
+    #[inline(always)]
+    fn write_usize(&mut self, n: usize) { self.add(n as u64); }
+    #[inline(always)]
+    fn write_u8(&mut self, n: u8) { self.add(n as u64); }
+    #[inline(always)]
+    fn finish(&self) -> u64 {
+        let t = (self.h as u128).wrapping_mul(0xD6E8_FEB8_6659_FD93u128);
+        (t as u64) ^ ((t >> 64) as u64)
+    }
+}
+
+type FastMap<K, V> = HashMap<K, V, BuildHasherDefault<FastHasher>>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Op { And, Or, Not }
+
+#[derive(Clone, Copy)]
+struct Query {
+    phrase: bool,
+    t_off: u32,
+    t_len: u32,
+    o_off: u32,
+    g_off: u32,
+    g_len: u32,
+}
+
+struct Queries {
+    items: Vec<Query>,
+    terms: Vec<u32>,
+    ops: Vec<Op>,
+    targets: Vec<u8>,
 }
 
 fn build_trans_table() -> [u8; 256] {
     let mut table = [b' '; 256];
-    for b in b'0'..=b'9' {
-        table[b as usize] = b;
-    }
-    for b in b'a'..=b'z' {
-        table[b as usize] = b;
-    }
-    for b in b'A'..=b'Z' {
-        table[b as usize] = b + 32;
-    }
+    for b in b'0'..=b'9' { table[b as usize] = b; }
+    for b in b'a'..=b'z' { table[b as usize] = b; }
+    for b in b'A'..=b'Z' { table[b as usize] = b + 32; }
     table
 }
 
-fn extract_queries(path: &Path) -> (Vec<Query>, HashMap<Vec<u8>, u32>) {
+fn extract_queries(path: &Path) -> (Queries, FastMap<Vec<u8>, u32>) {
     let mut raw = Vec::new();
-    File::open(path)
-        .expect("Failed to open queries.txt")
-        .read_to_end(&mut raw)
-        .expect("Failed to read queries.txt");
+    File::open(path).expect("open queries.txt").read_to_end(&mut raw).expect("read queries.txt");
 
-    let mut queries = Vec::new();
-    let mut term_to_id: HashMap<Vec<u8>, u32> = HashMap::new();
+    let mut items: Vec<Query> = Vec::with_capacity(raw.len() / 24 + 1);
+    let mut terms: Vec<u32> = Vec::with_capacity(raw.len() / 6 + 1);
+    let mut ops: Vec<Op> = Vec::with_capacity(raw.len() / 12 + 1);
+    let mut targets: Vec<u8> = Vec::new();
+    let mut term_to_id: FastMap<Vec<u8>, u32> = FastMap::with_capacity_and_hasher(1 << 16, Default::default());
+
+    #[inline(always)]
+    fn get_or_insert(map: &mut FastMap<Vec<u8>, u32>, term: &[u8]) -> u32 {
+        if let Some(&id) = map.get(term) { id }
+        else { let id = map.len() as u32; map.insert(term.to_vec(), id); id }
+    }
 
     for line in raw.split(|&b| b == b'\n') {
-        let line = if line.ends_with(b"\r") {
-            &line[..line.len() - 1]
-        } else {
-            line
-        };
-        if line.is_empty() {
-            continue;
-        }
+        let line = if line.ends_with(b"\r") { &line[..line.len()-1] } else { line };
+        if line.is_empty() { continue; }
 
-        let first_space = line.iter().position(|&b| b == b' ');
-        if let Some(pos) = first_space {
+        if let Some(pos) = line.iter().position(|&b| b == b' ') {
             let kind = &line[..pos];
-            let rest = &line[pos + 1..];
+            let rest = &line[pos+1..];
 
             if kind == b"BOOL" {
-                let parts: Vec<&[u8]> = rest.split(|&b| b == b' ').collect();
-                let mut terms = Vec::with_capacity((parts.len() + 1) / 2);
-                let mut ops = Vec::with_capacity(parts.len() / 2);
-
-                let next_id = term_to_id.len() as u32;
-                let id0 = *term_to_id.entry(parts[0].to_vec()).or_insert(next_id);
-                terms.push(id0);
-
-                let mut i = 1;
-                while i < parts.len() {
-                    let op = match parts[i] {
-                        b"AND" => Op::And,
-                        b"OR" => Op::Or,
-                        b"NOT" => Op::Not,
-                        _ => panic!("Unknown operator {:?}", parts[i]),
-                    };
-                    ops.push(op);
-                    let next_id = term_to_id.len() as u32;
-                    let id = *term_to_id.entry(parts[i + 1].to_vec()).or_insert(next_id);
-                    terms.push(id);
-                    i += 2;
+                let t_off = terms.len();
+                let o_off = ops.len();
+                let mut it = rest.split(|&b| b == b' ');
+                let first = it.next().unwrap();
+                terms.push(get_or_insert(&mut term_to_id, first));
+                while let Some(op) = it.next() {
+                    ops.push(match op {
+                        b"AND" => Op::And, b"OR" => Op::Or, b"NOT" => Op::Not,
+                        _ => panic!("Unknown op"),
+                    });
+                    let t = it.next().unwrap();
+                    terms.push(get_or_insert(&mut term_to_id, t));
                 }
-                queries.push(Query::Bool { terms, ops });
+                items.push(Query {
+                    phrase: false,
+                    t_off: t_off as u32,
+                    t_len: (terms.len() - t_off) as u32,
+                    o_off: o_off as u32,
+                    g_off: 0,
+                    g_len: 0,
+                });
             } else if kind == b"PHRASE" {
                 let inner = if rest.starts_with(b"\"") && rest.ends_with(b"\"") {
-                    &rest[1..rest.len() - 1]
-                } else {
-                    rest
-                };
-                let words: Vec<&[u8]> = inner.split(|&b| b == b' ').collect();
-                let mut term_ids = Vec::with_capacity(words.len());
-                let mut target = Vec::new();
-                target.push(b' ');
-                for (idx, w) in words.iter().enumerate() {
-                    if idx > 0 {
-                        target.push(b' ');
-                    }
-                    target.extend_from_slice(w);
-                    let next_id = term_to_id.len() as u32;
-                    let id = *term_to_id.entry(w.to_vec()).or_insert(next_id);
-                    term_ids.push(id);
+                    &rest[1..rest.len()-1]
+                } else { rest };
+                let t_off = terms.len();
+                let g_off = targets.len();
+                targets.push(b' ');
+                for (idx, w) in inner.split(|&b| b == b' ').enumerate() {
+                    if idx > 0 { targets.push(b' '); }
+                    targets.extend_from_slice(w);
+                    terms.push(get_or_insert(&mut term_to_id, w));
                 }
-                target.push(b' ');
-                queries.push(Query::Phrase { terms: term_ids, target });
+                targets.push(b' ');
+                items.push(Query {
+                    phrase: true,
+                    t_off: t_off as u32,
+                    t_len: (terms.len() - t_off) as u32,
+                    o_off: 0,
+                    g_off: g_off as u32,
+                    g_len: (targets.len() - g_off) as u32,
+                });
             }
         }
     }
-
-    (queries, term_to_id)
-}
-
-struct DocArena {
-    chunks: Vec<Vec<u8>>,
-    offsets: Vec<(u8, u32, u32)>,
-}
-
-impl DocArena {
-    #[inline(always)]
-    fn get_doc(&self, id: u32) -> &[u8] {
-        let (chunk_idx, start, end) = self.offsets[id as usize];
-        &self.chunks[chunk_idx as usize][start as usize..end as usize]
-    }
+    (Queries { items, terms, ops, targets }, term_to_id)
 }
 
 struct InvertedIndex {
     doc_ids: Vec<u32>,
     offsets: Vec<u32>,
 }
-
 impl InvertedIndex {
     #[inline(always)]
     fn get(&self, tid: u32) -> &[u32] {
-        let start = self.offsets[tid as usize] as usize;
-        let end = self.offsets[tid as usize + 1] as usize;
-        &self.doc_ids[start..end]
+        let s = self.offsets[tid as usize] as usize;
+        let e = self.offsets[tid as usize + 1] as usize;
+        &self.doc_ids[s..e]
     }
 }
 
-fn load_corpus(
-    path: &Path,
-    term_ids: &HashMap<Vec<u8>, u32>,
-) -> (DocArena, InvertedIndex) {
-    let mut raw: Vec<u8> = Vec::with_capacity(16 * 1024 * 1024);
-    File::open(path)
-        .expect("Failed to open docs.txt")
-        .read_to_end(&mut raw)
-        .expect("Failed to read docs.txt");
+struct DocStore {
+    data: Vec<u8>,
+    spans: Vec<(u32, u32)>,
+}
+impl DocStore {
+    #[inline(always)]
+    fn get_doc(&self, id: u32) -> &[u8] {
+        let (s, e) = self.spans[id as usize];
+        &self.data[s as usize..e as usize]
+    }
+}
+
+fn read_docs(path: &Path) -> Vec<u8> {
+    let mut f = File::open(path).expect("open docs.txt");
+    let len = f.metadata().map(|m| m.len() as usize).unwrap_or(270 * 1024 * 1024);
+    let mut raw: Vec<u8> = Vec::with_capacity(len + 1);
+    f.read_to_end(&mut raw).expect("read docs.txt");
+    raw
+}
+
+fn load_corpus(raw: Vec<u8>, term_ids: &FastMap<Vec<u8>, u32>) -> (DocStore, InvertedIndex) {
 
     let trans_table = build_trans_table();
-
-    let nthreads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .min(8);
-
+    let nthreads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(8);
     let n_terms = term_ids.len();
 
-    // Find chunk boundaries at line starts so no line is split across threads
     let mut byte_starts: Vec<usize> = vec![0];
     for i in 1..nthreads {
         let mut pos = (i * raw.len()) / nthreads;
-        while pos < raw.len() && raw[pos] != b'\n' {
-            pos += 1;
-        }
-        if pos < raw.len() {
-            pos += 1; // skip the newline itself
-        }
+        while pos < raw.len() && raw[pos] != b'\n' { pos += 1; }
+        if pos < raw.len() { pos += 1; }
         byte_starts.push(pos);
     }
     byte_starts.push(raw.len());
 
-    // Pre-count non-empty docs per chunk so each thread knows its doc_id range
-    let mut doc_id_starts: Vec<u32> = vec![0];
-    let mut cumulative: u32 = 0;
-    for i in 0..nthreads {
-        let chunk = &raw[byte_starts[i]..byte_starts[i + 1]];
-        let count = chunk
-            .split(|&b| b == b'\n')
-            .filter(|line| {
-                let line = if line.ends_with(b"\r") { &line[..line.len() - 1] } else { line };
-                !line.is_empty()
-            })
-            .count() as u32;
-        cumulative += count;
-        doc_id_starts.push(cumulative);
-    }
-
-    // Each thread returns: (arena_data, arena_offsets, Vec<Vec<u32>> by term_id)
     type ChunkResult = (Vec<u8>, Vec<(u32, u32)>, Vec<Vec<u32>>);
 
     let results: Vec<ChunkResult> = std::thread::scope(|s| {
-        let raw_ref = &raw[..];
+        let raw_ref      = &raw[..];
         let term_ids_ref = term_ids;
         let mut handles = Vec::with_capacity(nthreads);
+
         for i in 0..nthreads {
-            let start = byte_starts[i];
-            let end = byte_starts[i + 1];
-            let doc_id_start = doc_id_starts[i];
+            let bstart = byte_starts[i];
+            let bend   = byte_starts[i + 1];
+
             handles.push(s.spawn(move || {
-                let chunk = &raw_ref[start..end];
+                let chunk = &raw_ref[bstart..bend];
                 let mut local_postings: Vec<Vec<u32>> = vec![Vec::new(); n_terms];
-                let mut arena_data: Vec<u8> = Vec::new();
-                let mut arena_offsets: Vec<(u32, u32)> = Vec::new();
-                let mut doc_id = doc_id_start;
+                let mut norm_data: Vec<u8>     = Vec::with_capacity(chunk.len());
+                let mut spans: Vec<(u32, u32)> = Vec::with_capacity(chunk.len() / 40);
+                let mut doc_id: u32 = 0;
 
                 for line in chunk.split(|&b| b == b'\n') {
-                    let line = if line.ends_with(b"\r") {
-                        &line[..line.len() - 1]
-                    } else {
-                        line
-                    };
+                    let line = if line.ends_with(b"\r") { &line[..line.len()-1] } else { line };
                     if line.is_empty() { continue; }
 
                     let text = match line.iter().position(|&b| b == b'\t') {
-                        Some(t) => &line[t + 1..],
-                        None => b"",
+                        Some(t) => &line[t+1..],
+                        None    => b"",
                     };
 
-                    let start_offset = arena_data.len() as u32;
-                    arena_data.push(b' ');
+                    let doc_start = norm_data.len() as u32;
+                    norm_data.push(b' ');
 
                     let mut in_token = false;
-                    let mut tok_start = 0;
+                    let mut tok_start = 0usize;
 
                     for &b in text {
                         let norm = trans_table[b as usize];
                         if norm != b' ' {
-                            if !in_token {
-                                in_token = true;
-                                tok_start = arena_data.len();
-                            }
-                            arena_data.push(norm);
+                            if !in_token { in_token = true; tok_start = norm_data.len(); }
+                            norm_data.push(norm);
                         } else if in_token {
-                            let tok = &arena_data[tok_start..];
+                            let tok = &norm_data[tok_start..];
                             if let Some(&tid) = term_ids_ref.get(tok) {
-                                let postings = &mut local_postings[tid as usize];
-                                if postings.last().copied() != Some(doc_id) {
-                                    postings.push(doc_id);
-                                }
+                                let p = &mut local_postings[tid as usize];
+                                if p.last().copied() != Some(doc_id) { p.push(doc_id); }
                             }
-                            arena_data.push(b' ');
+                            norm_data.push(b' ');
                             in_token = false;
                         }
                     }
-
                     if in_token {
-                        let tok = &arena_data[tok_start..];
+                        let tok = &norm_data[tok_start..];
                         if let Some(&tid) = term_ids_ref.get(tok) {
-                            let postings = &mut local_postings[tid as usize];
-                            if postings.last().copied() != Some(doc_id) {
-                                postings.push(doc_id);
-                            }
+                            let p = &mut local_postings[tid as usize];
+                            if p.last().copied() != Some(doc_id) { p.push(doc_id); }
                         }
-                        arena_data.push(b' ');
-                    } else if arena_data.len() as u32 == start_offset + 1 {
-                        arena_data.push(b' ');
+                        norm_data.push(b' ');
+                    } else if norm_data.len() as u32 == doc_start + 1 {
+                        norm_data.push(b' ');
                     }
 
-                    let end_offset = arena_data.len() as u32;
-                    arena_offsets.push((start_offset, end_offset));
+                    spans.push((doc_start, norm_data.len() as u32));
                     doc_id += 1;
                 }
-
-                (arena_data, arena_offsets, local_postings)
+                (norm_data, spans, local_postings)
             }));
         }
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
-    // Drop the large raw file buffer immediately to release memory before merge
     drop(raw);
 
-    // --- Merge phase into flat InvertedIndex ---
-    // 1. Calculate total postings per term across all worker chunks
+    let mut doc_id_starts: Vec<u32> = Vec::with_capacity(nthreads + 1);
+    let mut cumulative: u32 = 0;
+    doc_id_starts.push(0);
+    for (_, spans, _) in &results {
+        cumulative += spans.len() as u32;
+        doc_id_starts.push(cumulative);
+    }
+
     let mut term_counts: Vec<u32> = vec![0; n_terms];
-    for (_, _, partial_postings) in &results {
-        for (tid, postings) in partial_postings.iter().enumerate() {
-            term_counts[tid] += postings.len() as u32;
-        }
+    for (_, _, pp) in &results {
+        for (tid, p) in pp.iter().enumerate() { term_counts[tid] += p.len() as u32; }
     }
+    let mut inv_offsets: Vec<u32> = Vec::with_capacity(n_terms + 1);
+    let mut total: u32 = 0;
+    inv_offsets.push(0);
+    for &c in &term_counts { total += c; inv_offsets.push(total); }
+    let mut doc_ids: Vec<u32> = vec![0u32; total as usize];
+    let mut write_pos = inv_offsets[..n_terms].to_vec();
 
-    // 2. Prefix sum to build offsets array of size (n_terms + 1)
-    let mut offsets: Vec<u32> = Vec::with_capacity(n_terms + 1);
-    let mut total_postings: u32 = 0;
-    offsets.push(0);
-    for &count in &term_counts {
-        total_postings += count;
-        offsets.push(total_postings);
-    }
+    let total_docs  = doc_id_starts[nthreads] as usize;
+    let total_bytes: usize = results.iter().map(|(d, _, _)| d.len()).sum();
+    let mut flat_data: Vec<u8>       = Vec::with_capacity(total_bytes);
+    let mut all_spans: Vec<(u32,u32)> = vec![(0,0); total_docs];
 
-    // 3. Allocate one contiguous buffer for ALL postings
-    let mut doc_ids: Vec<u32> = vec![0; total_postings as usize];
-    let mut write_pos = offsets[..n_terms].to_vec();
-
-    // 4. Fill doc_ids and build DocArena chunks
-    let mut chunks: Vec<Vec<u8>> = Vec::with_capacity(results.len());
-    let mut arena_offsets: Vec<(u8, u32, u32)> = Vec::with_capacity(250_000);
-
-    for (chunk_idx, (partial_data, partial_offsets, partial_postings)) in results.into_iter().enumerate() {
-        let c_idx = chunk_idx as u8;
-        chunks.push(partial_data);
-        for (s, e) in partial_offsets {
-            arena_offsets.push((c_idx, s, e));
+    for (ci, (norm_data, spans, pp)) in results.into_iter().enumerate() {
+        let base     = flat_data.len() as u32;
+        let doc_base = doc_id_starts[ci] as usize;
+        let doc_off  = doc_id_starts[ci];
+        for (li, (s, e)) in spans.into_iter().enumerate() {
+            all_spans[doc_base + li] = (base + s, base + e);
         }
-        for (tid, postings) in partial_postings.into_iter().enumerate() {
+        flat_data.extend_from_slice(&norm_data);
+        for (tid, postings) in pp.into_iter().enumerate() {
             let len = postings.len();
             if len > 0 {
                 let wp = write_pos[tid] as usize;
-                doc_ids[wp..wp + len].copy_from_slice(&postings);
+                for (d, &p) in doc_ids[wp..wp+len].iter_mut().zip(postings.iter()) { *d = p + doc_off; }
                 write_pos[tid] += len as u32;
             }
         }
     }
 
-    (
-        DocArena {
-            chunks,
-            offsets: arena_offsets,
-        },
-        InvertedIndex {
-            doc_ids,
-            offsets,
-        },
-    )
+    (DocStore { data: flat_data, spans: all_spans },
+     InvertedIndex { doc_ids, offsets: inv_offsets })
 }
 
 #[inline(always)]
 fn gallop(slice: &[u32], target: u32) -> usize {
     let n = slice.len();
-    if n == 0 || slice[0] >= target {
-        return 0;
-    }
-    let mut step = 1;
-    let mut prev = 0;
-    while step < n && slice[step] < target {
-        prev = step;
-        step <<= 1;
-    }
+    if n == 0 || slice[0] >= target { return 0; }
+    let mut step = 1; let mut prev = 0;
+    while step < n && slice[step] < target { prev = step; step <<= 1; }
     let high = step.min(n);
-    let mut low = prev;
-    let mut len = high - low;
+    let mut low = prev; let mut len = high - low;
     while len > 0 {
-        let half = len / 2;
-        let mid = low + half;
-        if slice[mid] < target {
-            low = mid + 1;
-            len -= half + 1;
-        } else {
-            len = half;
-        }
+        let half = len / 2; let mid = low + half;
+        if slice[mid] < target { low = mid+1; len -= half+1; } else { len = half; }
     }
     low
 }
 
 fn intersect(mut a: &[u32], mut b: &[u32], out: &mut Vec<u32>) {
-    out.clear();
-    out.reserve(a.len().min(b.len()));
-
+    out.clear(); out.reserve(a.len().min(b.len()));
     while !a.is_empty() && !b.is_empty() {
-        let va = a[0];
-        let vb = b[0];
-        if va == vb {
-            out.push(va);
-            a = &a[1..];
-            b = &b[1..];
-        } else if va < vb {
-            if a.len() > 16 * b.len() {
-                let idx = gallop(a, vb);
-                a = &a[idx..];
-            } else {
-                a = &a[1..];
-            }
-        } else {
-            if b.len() > 16 * a.len() {
-                let idx = gallop(b, va);
-                b = &b[idx..];
-            } else {
-                b = &b[1..];
-            }
-        }
+        let va = a[0]; let vb = b[0];
+        if      va == vb { out.push(va); a = &a[1..]; b = &b[1..]; }
+        else if va <  vb { if a.len() > 16*b.len() { a = &a[gallop(a,vb)..]; } else { a = &a[1..]; } }
+        else             { if b.len() > 16*a.len() { b = &b[gallop(b,va)..]; } else { b = &b[1..]; } }
     }
 }
 
 fn union(a: &[u32], b: &[u32], out: &mut Vec<u32>) {
-    out.clear();
-    out.reserve(a.len() + b.len());
-    let mut i = 0;
-    let mut j = 0;
-    let na = a.len();
-    let nb = b.len();
-    while i < na && j < nb {
-        let va = a[i];
-        let vb = b[j];
-        if va == vb {
-            out.push(va);
-            i += 1;
-            j += 1;
-        } else if va < vb {
-            out.push(va);
-            i += 1;
-        } else {
-            out.push(vb);
-            j += 1;
-        }
+    out.clear(); out.reserve(a.len() + b.len());
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        if      a[i] == b[j] { out.push(a[i]); i+=1; j+=1; }
+        else if a[i] <  b[j] { out.push(a[i]); i+=1; }
+        else                  { out.push(b[j]); j+=1; }
     }
-    if i < na {
-        out.extend_from_slice(&a[i..]);
-    } else if j < nb {
-        out.extend_from_slice(&b[j..]);
-    }
+    if i < a.len() { out.extend_from_slice(&a[i..]); }
+    else if j < b.len() { out.extend_from_slice(&b[j..]); }
 }
 
 fn difference(mut a: &[u32], mut b: &[u32], out: &mut Vec<u32>) {
-    out.clear();
-    out.reserve(a.len());
-
+    out.clear(); out.reserve(a.len());
     while !a.is_empty() && !b.is_empty() {
-        let va = a[0];
-        let vb = b[0];
-        if va == vb {
-            a = &a[1..];
-            b = &b[1..];
-        } else if va < vb {
-            out.push(va);
-            a = &a[1..];
-        } else {
-            if b.len() > 16 * a.len() {
-                let idx = gallop(b, va);
-                b = &b[idx..];
-            } else {
-                b = &b[1..];
-            }
-        }
+        let va = a[0]; let vb = b[0];
+        if      va == vb { a = &a[1..]; b = &b[1..]; }
+        else if va <  vb { out.push(va); a = &a[1..]; }
+        else             { if b.len() > 16*a.len() { b = &b[gallop(b,va)..]; } else { b = &b[1..]; } }
     }
-    if !a.is_empty() {
-        out.extend_from_slice(a);
-    }
+    if !a.is_empty() { out.extend_from_slice(a); }
 }
 
 fn run_bool<'a>(
-    index: &'a InvertedIndex,
-    terms: &[u32],
-    ops: &[Op],
-    buf_a: &'a mut Vec<u32>,
-    buf_b: &'a mut Vec<u32>,
+    index: &'a InvertedIndex, terms: &[u32], ops: &[Op],
+    buf_a: &'a mut Vec<u32>, buf_b: &'a mut Vec<u32>,
 ) -> &'a [u32] {
     let first = index.get(terms[0]);
-
-    if ops.is_empty() {
-        return first;
-    }
-
-    buf_a.clear();
-    buf_a.extend_from_slice(first);
-
-    let mut current_in_a = true;
-
-    for (op, &term_id) in ops.iter().zip(terms[1..].iter()) {
-        let postings = index.get(term_id);
+    if ops.is_empty() { return first; }
+    buf_a.clear(); buf_a.extend_from_slice(first);
+    let mut in_a = true;
+    for (op, &tid) in ops.iter().zip(terms[1..].iter()) {
+        let p = index.get(tid);
         match op {
-            Op::And => {
-                if current_in_a {
-                    if buf_a.is_empty() {
-                        continue;
-                    }
-                    intersect(buf_a, postings, buf_b);
-                    current_in_a = false;
-                } else {
-                    if buf_b.is_empty() {
-                        continue;
-                    }
-                    intersect(buf_b, postings, buf_a);
-                    current_in_a = true;
-                }
-            }
-            Op::Or => {
-                if current_in_a {
-                    union(buf_a, postings, buf_b);
-                    current_in_a = false;
-                } else {
-                    union(buf_b, postings, buf_a);
-                    current_in_a = true;
-                }
-            }
-            Op::Not => {
-                if current_in_a {
-                    if buf_a.is_empty() {
-                        continue;
-                    }
-                    difference(buf_a, postings, buf_b);
-                    current_in_a = false;
-                } else {
-                    if buf_b.is_empty() {
-                        continue;
-                    }
-                    difference(buf_b, postings, buf_a);
-                    current_in_a = true;
-                }
-            }
+            Op::And => { if in_a { if buf_a.is_empty() { continue; } intersect(buf_a, p, buf_b); in_a=false; }
+                         else    { if buf_b.is_empty() { continue; } intersect(buf_b, p, buf_a); in_a=true;  } }
+            Op::Or  => { if in_a { union(buf_a, p, buf_b); in_a=false; }
+                         else    { union(buf_b, p, buf_a); in_a=true;  } }
+            Op::Not => { if in_a { if buf_a.is_empty() { continue; } difference(buf_a, p, buf_b); in_a=false; }
+                         else    { if buf_b.is_empty() { continue; } difference(buf_b, p, buf_a); in_a=true;  } }
         }
     }
-
-    if current_in_a {
-        buf_a.as_slice()
-    } else {
-        buf_b.as_slice()
-    }
+    if in_a { buf_a } else { buf_b }
 }
 
-// Fast substring search on byte slice using vectorized first-byte search
+#[inline(always)]
 fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
-    let n = needle.len();
-    let h = haystack.len();
-    if n == 0 {
-        return true;
-    }
-    if h < n {
-        return false;
-    }
-    let first = needle[0];
-    let rest = &needle[1..];
+    let n = needle.len(); let h = haystack.len();
+    if n == 0 { return true; }
+    if h < n  { return false; }
+    let first = needle[0]; let rest = &needle[1..];
     let mut offset = 0;
-
     while offset + n <= h {
-        let remaining = &haystack[offset..=h - n];
-        if let Some(pos) = remaining.iter().position(|&b| b == first) {
-            let match_pos = offset + pos;
-            if &haystack[match_pos + 1..match_pos + n] == rest {
-                return true;
-            }
-            offset = match_pos + 1;
-        } else {
-            break;
-        }
+        if let Some(pos) = haystack[offset..=h-n].iter().position(|&b| b == first) {
+            let mp = offset + pos;
+            if &haystack[mp+1..mp+n] == rest { return true; }
+            offset = mp + 1;
+        } else { break; }
     }
     false
 }
 
 fn run_phrase(
-    index: &InvertedIndex,
-    doc_arena: &DocArena,
-    terms: &[u32],
-    target: &[u8],
-    buf_a: &mut Vec<u32>,
-    buf_b: &mut Vec<u32>,
-    matches: &mut Vec<u32>,
+    index: &InvertedIndex, doc_store: &DocStore, terms: &[u32], target: &[u8],
+    buf_a: &mut Vec<u32>, buf_b: &mut Vec<u32>, matches: &mut Vec<u32>,
 ) {
     matches.clear();
-
-    // terms are pre-sorted rarest-first once after corpus indexing
     let first = index.get(terms[0]);
-    if first.is_empty() {
-        return;
+    if first.is_empty() { return; }
+    buf_a.clear(); buf_a.extend_from_slice(first);
+    let mut in_a = true;
+    for &tid in &terms[1..] {
+        let p = index.get(tid);
+        if in_a { if buf_a.is_empty() { return; } intersect(buf_a, p, buf_b); in_a=false; }
+        else    { if buf_b.is_empty() { return; } intersect(buf_b, p, buf_a); in_a=true;  }
     }
-
-    buf_a.clear();
-    buf_a.extend_from_slice(first);
-    let mut current_in_a = true;
-
-    for &term_id in &terms[1..] {
-        let postings = index.get(term_id);
-        if current_in_a {
-            if buf_a.is_empty() {
-                return;
-            }
-            intersect(buf_a, postings, buf_b);
-            current_in_a = false;
-        } else {
-            if buf_b.is_empty() {
-                return;
-            }
-            intersect(buf_b, postings, buf_a);
-            current_in_a = true;
-        }
-    }
-
-    let candidates = if current_in_a {
-        buf_a.as_slice()
-    } else {
-        buf_b.as_slice()
-    };
-
-    if candidates.is_empty() {
-        return;
-    }
-
+    let candidates = if in_a { buf_a.as_slice() } else { buf_b.as_slice() };
     for &doc_id in candidates {
-        if contains_subslice(doc_arena.get_doc(doc_id), target) {
-            matches.push(doc_id);
-        }
+        if contains_subslice(doc_store.get_doc(doc_id), target) { matches.push(doc_id); }
     }
 }
 
 fn format_result<W: Write>(writer: &mut W, ids: &[u32]) {
-    if ids.is_empty() {
-        writeln!(writer, "0 0").unwrap();
-        return;
-    }
+    if ids.is_empty() { writeln!(writer, "0 0").unwrap(); return; }
     let count = ids.len();
     let sum: u64 = ids.iter().map(|&x| x as u64).sum();
     write!(writer, "{} {}", count, sum).unwrap();
-
-    let take = count.min(10);
-    for &id in &ids[..take] {
-        write!(writer, " {}", id).unwrap();
-    }
+    for &id in &ids[..count.min(10)] { write!(writer, " {}", id).unwrap(); }
     writeln!(writer).unwrap();
 }
 
 fn main() {
     let args: Vec<String> = env::args().collect();
     let mut data_dir = "/data".to_string();
-    let mut out_dir = "/out".to_string();
-
+    let mut out_dir  = "/out".to_string();
     let mut i = 1;
     while i < args.len() {
-        if args[i] == "--data" && i + 1 < args.len() {
-            data_dir = args[i + 1].clone();
-            i += 2;
-        } else if args[i] == "--out" && i + 1 < args.len() {
-            out_dir = args[i + 1].clone();
-            i += 2;
-        } else {
-            i += 1;
-        }
+        if      args[i] == "--data" && i+1 < args.len() { data_dir = args[i+1].clone(); i += 2; }
+        else if args[i] == "--out"  && i+1 < args.len() { out_dir  = args[i+1].clone(); i += 2; }
+        else { i += 1; }
     }
 
     let data_path = Path::new(&data_dir);
-    let out_path = Path::new(&out_dir);
+    let out_path  = Path::new(&out_dir);
+
+    let docs_path = data_path.join(DOCS_FILE);
+    let reader = std::thread::spawn(move || read_docs(&docs_path));
 
     let t0 = std::time::Instant::now();
     let (mut queries, term_to_id) = extract_queries(&data_path.join(QUERIES_FILE));
     let t_queries = t0.elapsed();
 
     let t1 = std::time::Instant::now();
-    let (doc_arena, index) = load_corpus(&data_path.join(DOCS_FILE), &term_to_id);
-    let t_corpus = t1.elapsed();
+    let raw = reader.join().expect("docs reader");
+    let t_wait = t1.elapsed();
 
-    // Pre-sort phrase query terms by posting length (rarest first) once
-    for query in &mut queries {
-        if let Query::Phrase { terms, .. } = query {
-            terms.sort_by_key(|&t| index.get(t).len());
+    let t2 = std::time::Instant::now();
+    let (doc_store, index) = load_corpus(raw, &term_to_id);
+    let t_corpus = t2.elapsed();
+
+    {
+        let Queries { items, terms, .. } = &mut queries;
+        for q in items.iter() {
+            if q.phrase {
+                let t = &mut terms[q.t_off as usize..(q.t_off + q.t_len) as usize];
+                t.sort_unstable_by_key(|&x| index.get(x).len());
+            }
         }
     }
 
-    std::fs::create_dir_all(out_path).expect("Failed to create out directory");
-    let out_file = File::create(out_path.join(RESULTS_FILE)).expect("Failed to create results.txt");
+    std::fs::create_dir_all(out_path).expect("create out dir");
+    let out_file = File::create(out_path.join(RESULTS_FILE)).expect("create results.txt");
     let mut writer = BufWriter::new(out_file);
 
-    let mut bool_dur = std::time::Duration::ZERO;
-    let mut phrase_dur = std::time::Duration::ZERO;
+    let nthreads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(8);
+    let chunk_size = (queries.items.len() + nthreads - 1) / nthreads;
+    let query_chunks: Vec<&[Query]> = queries.items.chunks(chunk_size).collect();
+    let terms_ref: &[u32] = &queries.terms;
+    let ops_ref: &[Op] = &queries.ops;
+    let targets_ref: &[u8] = &queries.targets;
 
-    let mut buf_a: Vec<u32> = Vec::new();
-    let mut buf_b: Vec<u32> = Vec::new();
-    let mut phrase_matches: Vec<u32> = Vec::new();
+    let t_eval = std::time::Instant::now();
+    let index_ref     = &index;
+    let doc_store_ref = &doc_store;
 
-    for query in &queries {
-        match query {
-            Query::Bool { terms, ops } => {
-                let q_start = std::time::Instant::now();
-                let res = run_bool(&index, terms, ops, &mut buf_a, &mut buf_b);
-                bool_dur += q_start.elapsed();
-                format_result(&mut writer, res);
-            }
-            Query::Phrase { terms, target } => {
-                let q_start = std::time::Instant::now();
-                run_phrase(&index, &doc_arena, terms, target, &mut buf_a, &mut buf_b, &mut phrase_matches);
-                phrase_dur += q_start.elapsed();
-                format_result(&mut writer, &phrase_matches);
-            }
-        }
-    }
+    let rendered: Vec<Vec<u8>> = std::thread::scope(|s| {
+        let handles: Vec<_> = query_chunks.into_iter().map(|chunk| {
+            s.spawn(move || {
+                let mut out = Vec::with_capacity(chunk.len() * 32);
+                let mut buf_a: Vec<u32> = Vec::new();
+                let mut buf_b: Vec<u32> = Vec::new();
+                let mut pm:    Vec<u32> = Vec::new();
+                for q in chunk {
+                    let terms = &terms_ref[q.t_off as usize..(q.t_off + q.t_len) as usize];
+                    if q.phrase {
+                        let target = &targets_ref[q.g_off as usize..(q.g_off + q.g_len) as usize];
+                        run_phrase(index_ref, doc_store_ref, terms, target, &mut buf_a, &mut buf_b, &mut pm);
+                        format_result(&mut out, &pm);
+                    } else {
+                        let ops = &ops_ref[q.o_off as usize..(q.o_off + q.t_len - 1) as usize];
+                        let r = run_bool(index_ref, terms, ops, &mut buf_a, &mut buf_b);
+                        format_result(&mut out, r);
+                    }
+                }
+                out
+            })
+        }).collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
 
-    eprintln!(
-        "[PROFILE] Queries parse: {:?} | Corpus index: {:?} | BOOL eval: {:?} | PHRASE eval: {:?}",
-        t_queries, t_corpus, bool_dur, phrase_dur
-    );
+    let eval_dur = t_eval.elapsed();
+    for buf in rendered { writer.write_all(&buf).expect("write"); }
+    writer.flush().expect("flush");
+
+    eprintln!("[PROFILE] Queries parse: {:?} | Docs read wait: {:?} | Corpus index: {:?} | Parallel query eval: {:?}",
+        t_queries, t_wait, t_corpus, eval_dur);
 }
