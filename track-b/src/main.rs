@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
 const DOCS_FILE: &str = "docs.txt";
@@ -20,8 +20,6 @@ enum Query {
     Phrase(Vec<Vec<u8>>),
 }
 
-// 256-byte ASCII mapping table:
-// 'A'..='Z' -> 'a'..='z', 'a'..='z' and '0'..='9' kept, all others -> b' ' (0x20)
 fn build_trans_table() -> [u8; 256] {
     let mut table = [b' '; 256];
     for b in b'0'..=b'9' {
@@ -36,9 +34,11 @@ fn build_trans_table() -> [u8; 256] {
     table
 }
 
-// Fast byte tokenization using space-separated runs
-fn tokenize_translated(bytes: &[u8]) -> Vec<&[u8]> {
-    let mut tokens = Vec::new();
+// Tokenize slice without storing long-lived borrows outside loop
+fn for_each_token<F>(bytes: &[u8], mut callback: F)
+where
+    F: FnMut(&[u8]),
+{
     let mut start = None;
     for (i, &b) in bytes.iter().enumerate() {
         if b != b' ' {
@@ -46,14 +46,13 @@ fn tokenize_translated(bytes: &[u8]) -> Vec<&[u8]> {
                 start = Some(i);
             }
         } else if let Some(s) = start {
-            tokens.push(&bytes[s..i]);
+            callback(&bytes[s..i]);
             start = None;
         }
     }
     if let Some(s) = start {
-        tokens.push(&bytes[s..]);
+        callback(&bytes[s..]);
     }
-    tokens
 }
 
 fn extract_queries(path: &Path) -> (Vec<Query>, HashSet<Vec<u8>>) {
@@ -63,6 +62,7 @@ fn extract_queries(path: &Path) -> (Vec<Query>, HashSet<Vec<u8>>) {
     let mut queries = Vec::new();
     let mut needed_terms = HashSet::new();
 
+    use std::io::BufRead;
     for line in reader.split(b'\n') {
         let mut line = line.expect("Failed to read line");
         if line.ends_with(b"\r") {
@@ -101,7 +101,6 @@ fn extract_queries(path: &Path) -> (Vec<Query>, HashSet<Vec<u8>>) {
                 }
                 queries.push(Query::Bool(terms, ops));
             } else if kind == b"PHRASE" {
-                // Remove outer quotes: "term1 term2 ... termk"
                 let inner = if rest.starts_with(b"\"") && rest.ends_with(b"\"") {
                     &rest[1..rest.len() - 1]
                 } else {
@@ -138,10 +137,12 @@ fn load_corpus(
     }
 
     let mut norm_docs = Vec::new();
-    let mut doc_seen: HashSet<&[u8]> = HashSet::new();
+    let mut doc_seen: HashSet<Vec<u8>> = HashSet::new();
 
     let mut start = 0;
     let mut doc_id: u32 = 0;
+    let mut clean = Vec::new();
+    let mut compact_doc = Vec::new();
 
     while start < buffer.len() {
         let end = buffer[start..]
@@ -162,38 +163,33 @@ fn load_corpus(
             b""
         };
 
-        // Translate text into normalized byte vector
-        let mut clean = Vec::with_capacity(text.len() + 2);
+        clean.clear();
         clean.push(b' ');
         for &b in text {
             clean.push(trans_table[b as usize]);
         }
         clean.push(b' ');
 
-        let tokens = tokenize_translated(&clean);
-
-        // Deduplicate tokens for this document
         doc_seen.clear();
-        for &tok in &tokens {
-            if doc_seen.insert(tok) {
+        compact_doc.clear();
+        compact_doc.push(b' ');
+
+        let mut first = true;
+        for_each_token(&clean, |tok| {
+            if doc_seen.insert(tok.to_vec()) {
                 if let Some(postings) = index.get_mut(tok) {
                     postings.push(doc_id);
                 }
             }
-        }
-
-        // Store space-collapsed normalized doc for fast substring phrase matching
-        let mut compact_doc = Vec::new();
-        compact_doc.push(b' ');
-        for (i, &tok) in tokens.iter().enumerate() {
-            if i > 0 {
+            if !first {
                 compact_doc.push(b' ');
             }
             compact_doc.extend_from_slice(tok);
-        }
-        compact_doc.push(b' ');
+            first = false;
+        });
 
-        norm_docs.push(compact_doc);
+        compact_doc.push(b' ');
+        norm_docs.push(compact_doc.clone());
 
         doc_id += 1;
         start = end + 1;
@@ -291,7 +287,7 @@ fn run_bool(
         match op {
             Op::And => {
                 if running.is_empty() {
-                    return running;
+                    continue;
                 }
                 running = intersect(&running, postings);
             }
@@ -300,7 +296,7 @@ fn run_bool(
             }
             Op::Not => {
                 if running.is_empty() {
-                    return running;
+                    continue;
                 }
                 running = difference(&running, postings);
             }
@@ -334,7 +330,6 @@ fn run_phrase(
         }
     }
 
-    // Target sequence: b" term1 term2 ... termk "
     let mut target = Vec::new();
     target.push(b' ');
     for (i, t) in terms.iter().enumerate() {
@@ -411,4 +406,3 @@ fn main() {
         }
     }
 }
-
