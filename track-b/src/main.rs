@@ -40,26 +40,6 @@ fn build_trans_table() -> [u8; 256] {
     table
 }
 
-fn for_each_token<'a, F>(bytes: &'a [u8], mut callback: F)
-where
-    F: FnMut(&'a [u8]),
-{
-    let mut start = None;
-    for (i, &b) in bytes.iter().enumerate() {
-        if b != b' ' {
-            if start.is_none() {
-                start = Some(i);
-            }
-        } else if let Some(s) = start {
-            callback(&bytes[s..i]);
-            start = None;
-        }
-    }
-    if let Some(s) = start {
-        callback(&bytes[s..]);
-    }
-}
-
 fn extract_queries(path: &Path) -> (Vec<Query>, HashMap<Vec<u8>, u32>) {
     let mut raw = Vec::new();
     File::open(path)
@@ -215,7 +195,6 @@ fn load_corpus(
                 let mut local_postings: Vec<Vec<u32>> = vec![Vec::new(); n_terms];
                 let mut arena_data: Vec<u8> = Vec::new();
                 let mut arena_offsets: Vec<(u32, u32)> = Vec::new();
-                let mut clean: Vec<u8> = Vec::new();
                 let mut doc_id = doc_id_start;
 
                 for line in chunk.split(|&b| b == b'\n') {
@@ -231,32 +210,46 @@ fn load_corpus(
                         None => b"",
                     };
 
-                    clean.clear();
-                    clean.push(b' ');
-                    for &b in text {
-                        clean.push(trans_table[b as usize]);
-                    }
-                    clean.push(b' ');
-
                     let start_offset = arena_data.len() as u32;
                     arena_data.push(b' ');
-                    let mut first = true;
 
-                    for_each_token(&clean, |tok| {
+                    let mut in_token = false;
+                    let mut tok_start = 0;
+
+                    for &b in text {
+                        let norm = trans_table[b as usize];
+                        if norm != b' ' {
+                            if !in_token {
+                                in_token = true;
+                                tok_start = arena_data.len();
+                            }
+                            arena_data.push(norm);
+                        } else if in_token {
+                            let tok = &arena_data[tok_start..];
+                            if let Some(&tid) = term_ids_ref.get(tok) {
+                                let postings = &mut local_postings[tid as usize];
+                                if postings.last().copied() != Some(doc_id) {
+                                    postings.push(doc_id);
+                                }
+                            }
+                            arena_data.push(b' ');
+                            in_token = false;
+                        }
+                    }
+
+                    if in_token {
+                        let tok = &arena_data[tok_start..];
                         if let Some(&tid) = term_ids_ref.get(tok) {
                             let postings = &mut local_postings[tid as usize];
                             if postings.last().copied() != Some(doc_id) {
                                 postings.push(doc_id);
                             }
                         }
-                        if !first {
-                            arena_data.push(b' ');
-                        }
-                        arena_data.extend_from_slice(tok);
-                        first = false;
-                    });
+                        arena_data.push(b' ');
+                    } else if arena_data.len() as u32 == start_offset + 1 {
+                        arena_data.push(b' ');
+                    }
 
-                    arena_data.push(b' ');
                     let end_offset = arena_data.len() as u32;
                     arena_offsets.push((start_offset, end_offset));
                     doc_id += 1;
