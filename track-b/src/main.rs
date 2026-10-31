@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
 
 const DOCS_FILE: &str = "docs.txt";
@@ -34,10 +34,9 @@ fn build_trans_table() -> [u8; 256] {
     table
 }
 
-// Tokenize slice without storing long-lived borrows outside loop
-fn for_each_token<F>(bytes: &[u8], mut callback: F)
+fn for_each_token<'a, F>(bytes: &'a [u8], mut callback: F)
 where
-    F: FnMut(&[u8]),
+    F: FnMut(&'a [u8]),
 {
     let mut start = None;
     for (i, &b) in bytes.iter().enumerate() {
@@ -62,7 +61,6 @@ fn extract_queries(path: &Path) -> (Vec<Query>, HashSet<Vec<u8>>) {
     let mut queries = Vec::new();
     let mut needed_terms = HashSet::new();
 
-    use std::io::BufRead;
     for line in reader.split(b'\n') {
         let mut line = line.expect("Failed to read line");
         if line.ends_with(b"\r") {
@@ -125,9 +123,8 @@ fn load_corpus(
     path: &Path,
     needed_terms: &HashSet<Vec<u8>>,
 ) -> (Vec<Vec<u8>>, HashMap<Vec<u8>, Vec<u32>>) {
-    let mut file = File::open(path).expect("Failed to open docs.txt");
-    let mut buffer = Vec::new();
-    file.read_to_end(&mut buffer).expect("Failed to read docs.txt");
+    let file = File::open(path).expect("Failed to open docs.txt");
+    let reader = BufReader::with_capacity(1024 * 1024, file);
 
     let trans_table = build_trans_table();
 
@@ -137,23 +134,18 @@ fn load_corpus(
     }
 
     let mut norm_docs = Vec::new();
-    let mut doc_seen: HashSet<Vec<u8>> = HashSet::new();
-
-    let mut start = 0;
-    let mut doc_id: u32 = 0;
     let mut clean = Vec::new();
     let mut compact_doc = Vec::new();
+    let mut doc_id: u32 = 0;
 
-    while start < buffer.len() {
-        let end = buffer[start..]
-            .iter()
-            .position(|&b| b == b'\n')
-            .map(|p| start + p)
-            .unwrap_or(buffer.len());
-
-        let mut line = &buffer[start..end];
+    for line in reader.split(b'\n') {
+        let mut line = line.expect("Failed to read line");
         if line.ends_with(b"\r") {
-            line = &line[..line.len() - 1];
+            line.pop();
+        }
+        if line.is_empty() && doc_id > 0 {
+            // Trailing empty lines
+            continue;
         }
 
         let tab_pos = line.iter().position(|&b| b == b'\t');
@@ -170,29 +162,30 @@ fn load_corpus(
         }
         clean.push(b' ');
 
-        doc_seen.clear();
         compact_doc.clear();
         compact_doc.push(b' ');
 
         let mut first = true;
-        for_each_token(&clean, |tok| {
-            if doc_seen.insert(tok.to_vec()) {
-                if let Some(postings) = index.get_mut(tok) {
-                    postings.push(doc_id);
+        {
+            let mut doc_seen: HashSet<&[u8]> = HashSet::new();
+            for_each_token(&clean, |tok| {
+                if doc_seen.insert(tok) {
+                    if let Some(postings) = index.get_mut(tok) {
+                        postings.push(doc_id);
+                    }
                 }
-            }
-            if !first {
-                compact_doc.push(b' ');
-            }
-            compact_doc.extend_from_slice(tok);
-            first = false;
-        });
+                if !first {
+                    compact_doc.push(b' ');
+                }
+                compact_doc.extend_from_slice(tok);
+                first = false;
+            });
+        }
 
         compact_doc.push(b' ');
         norm_docs.push(compact_doc.clone());
 
         doc_id += 1;
-        start = end + 1;
     }
 
     (norm_docs, index)
@@ -305,14 +298,25 @@ fn run_bool(
     running
 }
 
+// Fast substring search on byte slice
 fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
-    if needle.is_empty() {
+    let n = needle.len();
+    let h = haystack.len();
+    if n == 0 {
         return true;
     }
-    if haystack.len() < needle.len() {
+    if h < n {
         return false;
     }
-    haystack.windows(needle.len()).any(|w| w == needle)
+    let first = needle[0];
+    let mut i = 0;
+    while i + n <= h {
+        if haystack[i] == first && &haystack[i..i + n] == needle {
+            return true;
+        }
+        i += 1;
+    }
+    false
 }
 
 fn run_phrase(
@@ -321,9 +325,18 @@ fn run_phrase(
     terms: &[Vec<u8>],
 ) -> Vec<u32> {
     let empty = Vec::new();
-    let mut candidates = index.get(&terms[0]).unwrap_or(&empty).clone();
-    for term in &terms[1..] {
-        let postings = index.get(term).unwrap_or(&empty);
+
+    // Start with the rarest term to minimize candidate list immediately
+    let mut sorted_terms: Vec<&Vec<u8>> = terms.iter().collect();
+    sorted_terms.sort_by_key(|t| index.get(*t).map_or(0, |p| p.len()));
+
+    let mut candidates = index.get(sorted_terms[0]).unwrap_or(&empty).clone();
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+
+    for term in &sorted_terms[1..] {
+        let postings = index.get(*term).unwrap_or(&empty);
         candidates = intersect(&candidates, postings);
         if candidates.is_empty() {
             return Vec::new();
