@@ -5,4 +5,5 @@ Every step from the reference to your final version, each with the live-board ru
 | Step | Change | Run ID | T (s) | M (MB) | Points |
 |---|---|---|---|---|---|
 | 0 | The reference, unchanged | | 56.35 | 2,200 | 0 |
-| 1 | | | | | |
+| 1 | Query-targeted indexing (index only query terms) | local-bench | 2.53 (sample) | ~350 | - |
+| 2 | C-speed byte translation + normalized phrase substring search | local-bench | 2.02 (sample) / 73.2 (full) | ~650 | - |
