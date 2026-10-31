@@ -223,19 +223,37 @@ struct DocStore {
     trans: [u8; 256],
 }
 impl DocStore {
-    #[inline(always)]
-    fn normalize(&self, id: u32, out: &mut Vec<u8>) {
+    fn has_phrase(&self, id: u32, target: &[u8], words: &[(u32, u32)], toks: &mut Vec<(u32, u32)>) -> bool {
         let ci = self.starts.partition_point(|&s| s <= id) - 1;
         let (s, e) = self.spans[ci][(id - self.starts[ci]) as usize];
-        out.clear();
-        out.push(b' ');
-        let mut in_token = false;
-        for &b in &self.raw[s as usize..e as usize] {
-            let n = self.trans[b as usize];
-            if n != b' ' { out.push(n); in_token = true; }
-            else if in_token { out.push(b' '); in_token = false; }
+        let text = &self.raw[s as usize..e as usize];
+        let k = words.len();
+        toks.clear();
+        let mut start = usize::MAX;
+        for (i, &b) in text.iter().enumerate() {
+            if self.trans[b as usize] != b' ' {
+                if start == usize::MAX { start = i; }
+            } else if start != usize::MAX {
+                toks.push((start as u32, i as u32));
+                start = usize::MAX;
+            }
         }
-        if in_token || out.len() == 1 { out.push(b' '); }
+        if start != usize::MAX { toks.push((start as u32, text.len() as u32)); }
+        if toks.len() < k { return false; }
+        'outer: for i in 0..=toks.len() - k {
+            for j in 0..k {
+                let (a, b) = toks[i + j];
+                let (wa, wb) = words[j];
+                let w = &target[wa as usize..wb as usize];
+                if (b - a) as usize != w.len() { continue 'outer; }
+                let t = &text[a as usize..b as usize];
+                for (x, &y) in t.iter().zip(w.iter()) {
+                    if self.trans[*x as usize] != y { continue 'outer; }
+                }
+            }
+            return true;
+        }
+        false
     }
 }
 
@@ -456,26 +474,10 @@ fn run_bool<'a>(
     if in_a { buf_a } else { buf_b }
 }
 
-#[inline(always)]
-fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
-    let n = needle.len(); let h = haystack.len();
-    if n == 0 { return true; }
-    if h < n  { return false; }
-    let first = needle[0]; let rest = &needle[1..];
-    let mut offset = 0;
-    while offset + n <= h {
-        if let Some(pos) = haystack[offset..=h-n].iter().position(|&b| b == first) {
-            let mp = offset + pos;
-            if &haystack[mp+1..mp+n] == rest { return true; }
-            offset = mp + 1;
-        } else { break; }
-    }
-    false
-}
-
 fn run_phrase(
     index: &InvertedIndex, doc_store: &DocStore, terms: &[u32], target: &[u8],
-    buf_a: &mut Vec<u32>, buf_b: &mut Vec<u32>, matches: &mut Vec<u32>, scratch: &mut Vec<u8>,
+    buf_a: &mut Vec<u32>, buf_b: &mut Vec<u32>, matches: &mut Vec<u32>,
+    toks: &mut Vec<(u32, u32)>, words: &mut Vec<(u32, u32)>,
 ) {
     matches.clear();
     let first = index.get(terms[0]);
@@ -488,9 +490,18 @@ fn run_phrase(
         else    { if buf_b.is_empty() { return; } intersect(buf_b, p, buf_a); in_a=true;  }
     }
     let candidates = if in_a { buf_a.as_slice() } else { buf_b.as_slice() };
+    if candidates.is_empty() { return; }
+    words.clear();
+    let n = target.len();
+    let mut i = 0;
+    while i < n {
+        if target[i] == b' ' { i += 1; continue; }
+        let st = i;
+        while i < n && target[i] != b' ' { i += 1; }
+        words.push((st as u32, i as u32));
+    }
     for &doc_id in candidates {
-        doc_store.normalize(doc_id, scratch);
-        if contains_subslice(scratch, target) { matches.push(doc_id); }
+        if doc_store.has_phrase(doc_id, target, words, toks) { matches.push(doc_id); }
     }
 }
 
@@ -577,12 +588,13 @@ fn main() {
                 let mut buf_a: Vec<u32> = Vec::new();
                 let mut buf_b: Vec<u32> = Vec::new();
                 let mut pm:    Vec<u32> = Vec::new();
-                let mut scratch: Vec<u8> = Vec::new();
+                let mut toks: Vec<(u32, u32)> = Vec::new();
+                let mut words: Vec<(u32, u32)> = Vec::new();
                 for q in chunk {
                     let terms = &terms_ref[q.t_off as usize..(q.t_off + q.t_len) as usize];
                     if q.phrase {
                         let target = &targets_ref[q.g_off as usize..(q.g_off + q.g_len) as usize];
-                        run_phrase(index_ref, doc_store_ref, terms, target, &mut buf_a, &mut buf_b, &mut pm, &mut scratch);
+                        run_phrase(index_ref, doc_store_ref, terms, target, &mut buf_a, &mut buf_b, &mut pm, &mut toks, &mut words);
                         format_result(&mut out, &pm);
                     } else {
                         let ops = &ops_ref[q.o_off as usize..(q.o_off + q.t_len - 1) as usize];
