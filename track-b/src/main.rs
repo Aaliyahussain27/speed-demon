@@ -257,6 +257,79 @@ impl DocStore {
     }
 }
 
+const SLOT_EMPTY: u32 = u32::MAX;
+
+#[derive(Clone, Copy)]
+struct Slot {
+    k0: u64,
+    k1: u64,
+    id: u32,
+    len: u32,
+}
+
+struct TermTable {
+    slots: Vec<Slot>,
+    mask: usize,
+    long: FastMap<Vec<u8>, u32>,
+    n: usize,
+}
+
+#[inline(always)]
+fn pack_key(b: &[u8]) -> (u64, u64) {
+    let mut buf = [0u8; 16];
+    buf[..b.len()].copy_from_slice(b);
+    let v = u128::from_le_bytes(buf);
+    (v as u64, (v >> 64) as u64)
+}
+
+#[inline(always)]
+fn hash_key(k0: u64, k1: u64) -> u64 {
+    let x = (k0 ^ k1.rotate_left(29).wrapping_mul(0xA24B_AED4_963E_E407)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let t = (x as u128).wrapping_mul(0xD6E8_FEB8_6659_FD93u128);
+    (t as u64) ^ ((t >> 64) as u64)
+}
+
+impl TermTable {
+    fn from_map(map: &FastMap<Vec<u8>, u32>) -> TermTable {
+        let n = map.len();
+        let cap = (n * 2).max(16).next_power_of_two();
+        let mask = cap - 1;
+        let mut slots = vec![Slot { k0: 0, k1: 0, id: SLOT_EMPTY, len: 0 }; cap];
+        let mut long: FastMap<Vec<u8>, u32> = FastMap::default();
+        for (k, &id) in map.iter() {
+            if k.len() <= 16 {
+                let (k0, k1) = pack_key(k);
+                let mut i = (hash_key(k0, k1) as usize) & mask;
+                while slots[i].id != SLOT_EMPTY { i = (i + 1) & mask; }
+                slots[i] = Slot { k0, k1, id, len: k.len() as u32 };
+            } else {
+                long.insert(k.clone(), id);
+            }
+        }
+        TermTable { slots, mask, long, n }
+    }
+
+    #[inline(always)]
+    fn len(&self) -> usize { self.n }
+
+    #[inline(always)]
+    fn get(&self, tok: &[u8]) -> Option<u32> {
+        let n = tok.len();
+        if n <= 16 {
+            let (k0, k1) = pack_key(tok);
+            let mut i = (hash_key(k0, k1) as usize) & self.mask;
+            loop {
+                let s = &self.slots[i];
+                if s.id == SLOT_EMPTY { return None; }
+                if s.k0 == k0 && s.k1 == k1 && s.len as usize == n { return Some(s.id); }
+                i = (i + 1) & self.mask;
+            }
+        } else {
+            self.long.get(tok).copied()
+        }
+    }
+}
+
 #[inline(always)]
 fn for_each_token<F: FnMut(&[u8])>(text: &[u8], trans: &[u8; 256], tok: &mut Vec<u8>, mut f: F) {
     for &b in text {
@@ -315,7 +388,7 @@ fn read_docs(path: &Path) -> Vec<u8> {
     raw
 }
 
-fn load_corpus(raw: Vec<u8>, term_ids: &FastMap<Vec<u8>, u32>) -> (DocStore, InvertedIndex) {
+fn load_corpus(raw: Vec<u8>, term_ids: &TermTable) -> (DocStore, InvertedIndex) {
 
     let trans_table = build_trans_table();
     let nthreads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(8);
@@ -365,7 +438,7 @@ fn load_corpus(raw: Vec<u8>, term_ids: &FastMap<Vec<u8>, u32>) -> (DocStore, Inv
                     let text = &line[ts..];
 
                     for_each_token(text, &trans_table, &mut tok, |t| {
-                        if let Some(&tid) = term_ids_ref.get(t) {
+                        if let Some(tid) = term_ids_ref.get(t) {
                             let tid = tid as usize;
                             if last[tid] != doc_id { last[tid] = doc_id; counts[tid] += 1; }
                         }
@@ -435,7 +508,7 @@ fn load_corpus(raw: Vec<u8>, term_ids: &FastMap<Vec<u8>, u32>) -> (DocStore, Inv
                     let text = &raw_ref[st as usize..en as usize];
 
                     for_each_token(text, &trans_table, &mut tok, |t| {
-                        if let Some(&tid) = term_ids_ref.get(t) {
+                        if let Some(tid) = term_ids_ref.get(t) {
                             let tid = tid as usize;
                             if last[tid] != local {
                                 last[tid] = local;
@@ -602,7 +675,8 @@ fn main() {
     let t_wait = t1.elapsed();
 
     let t2 = std::time::Instant::now();
-    let (doc_store, index) = load_corpus(raw, &term_to_id);
+    let term_table = TermTable::from_map(&term_to_id);
+    let (doc_store, index) = load_corpus(raw, &term_table);
     let t_corpus = t2.elapsed();
 
     {
