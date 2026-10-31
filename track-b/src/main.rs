@@ -76,10 +76,64 @@ fn build_trans_table() -> [u8; 256] {
     table
 }
 
-fn extract_queries(path: &Path) -> (Queries, FastMap<Vec<u8>, u32>) {
-    let mut raw = Vec::new();
-    File::open(path).expect("open queries.txt").read_to_end(&mut raw).expect("read queries.txt");
+#[inline(always)]
+fn find_byte(hay: &[u8], needle: u8) -> Option<usize> {
+    const LO: u64 = 0x0101_0101_0101_0101;
+    const HI: u64 = 0x8080_8080_8080_8080;
+    let pat = LO.wrapping_mul(needle as u64);
+    let mut base = 0usize;
+    let mut chunks = hay.chunks_exact(8);
+    for c in &mut chunks {
+        let w = u64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]) ^ pat;
+        let z = w.wrapping_sub(LO) & !w & HI;
+        if z != 0 { return Some(base + (z.trailing_zeros() >> 3) as usize); }
+        base += 8;
+    }
+    for (i, &b) in chunks.remainder().iter().enumerate() {
+        if b == needle { return Some(base + i); }
+    }
+    None
+}
 
+struct SplitByte<'a> {
+    rest: &'a [u8],
+    sep: u8,
+    done: bool,
+}
+
+impl<'a> SplitByte<'a> {
+    #[inline(always)]
+    fn new(s: &'a [u8], sep: u8) -> Self { SplitByte { rest: s, sep, done: false } }
+}
+
+impl<'a> Iterator for SplitByte<'a> {
+    type Item = &'a [u8];
+    #[inline(always)]
+    fn next(&mut self) -> Option<&'a [u8]> {
+        if self.done { return None; }
+        match find_byte(self.rest, self.sep) {
+            Some(p) => {
+                let seg = &self.rest[..p];
+                self.rest = &self.rest[p + 1..];
+                Some(seg)
+            }
+            None => {
+                self.done = true;
+                Some(self.rest)
+            }
+        }
+    }
+}
+
+fn read_queries(path: &Path) -> Vec<u8> {
+    let mut qf = File::open(path).expect("open queries.txt");
+    let qlen = qf.metadata().map(|m| m.len() as usize).unwrap_or(0);
+    let mut raw: Vec<u8> = Vec::with_capacity(qlen + 1);
+    qf.read_to_end(&mut raw).expect("read queries.txt");
+    raw
+}
+
+fn extract_queries(raw: &[u8]) -> (Queries, FastMap<Vec<u8>, u32>) {
     let mut items: Vec<Query> = Vec::with_capacity(raw.len() / 24 + 1);
     let mut terms: Vec<u32> = Vec::with_capacity(raw.len() / 6 + 1);
     let mut ops: Vec<Op> = Vec::with_capacity(raw.len() / 12 + 1);
@@ -92,18 +146,18 @@ fn extract_queries(path: &Path) -> (Queries, FastMap<Vec<u8>, u32>) {
         else { let id = map.len() as u32; map.insert(term.to_vec(), id); id }
     }
 
-    for line in raw.split(|&b| b == b'\n') {
+    for line in SplitByte::new(raw, b'\n') {
         let line = if line.ends_with(b"\r") { &line[..line.len()-1] } else { line };
         if line.is_empty() { continue; }
 
-        if let Some(pos) = line.iter().position(|&b| b == b' ') {
+        if let Some(pos) = find_byte(line, b' ') {
             let kind = &line[..pos];
             let rest = &line[pos+1..];
 
             if kind == b"BOOL" {
                 let t_off = terms.len();
                 let o_off = ops.len();
-                let mut it = rest.split(|&b| b == b' ');
+                let mut it = SplitByte::new(rest, b' ');
                 let first = it.next().unwrap();
                 terms.push(get_or_insert(&mut term_to_id, first));
                 while let Some(op) = it.next() {
@@ -129,7 +183,7 @@ fn extract_queries(path: &Path) -> (Queries, FastMap<Vec<u8>, u32>) {
                 let t_off = terms.len();
                 let g_off = targets.len();
                 targets.push(b' ');
-                for (idx, w) in inner.split(|&b| b == b' ').enumerate() {
+                for (idx, w) in SplitByte::new(inner, b' ').enumerate() {
                     if idx > 0 { targets.push(b' '); }
                     targets.extend_from_slice(w);
                     terms.push(get_or_insert(&mut term_to_id, w));
@@ -163,20 +217,60 @@ impl InvertedIndex {
 }
 
 struct DocStore {
-    data: Vec<u8>,
-    spans: Vec<(u32, u32)>,
+    raw: Vec<u8>,
+    spans: Vec<Vec<(u32, u32)>>,
+    starts: Vec<u32>,
+    trans: [u8; 256],
 }
 impl DocStore {
     #[inline(always)]
-    fn get_doc(&self, id: u32) -> &[u8] {
-        let (s, e) = self.spans[id as usize];
-        &self.data[s as usize..e as usize]
+    fn normalize(&self, id: u32, out: &mut Vec<u8>) {
+        let ci = self.starts.partition_point(|&s| s <= id) - 1;
+        let (s, e) = self.spans[ci][(id - self.starts[ci]) as usize];
+        out.clear();
+        out.push(b' ');
+        let mut in_token = false;
+        for &b in &self.raw[s as usize..e as usize] {
+            let n = self.trans[b as usize];
+            if n != b' ' { out.push(n); in_token = true; }
+            else if in_token { out.push(b' '); in_token = false; }
+        }
+        if in_token || out.len() == 1 { out.push(b' '); }
     }
 }
 
+#[inline(always)]
+fn record(map: &FastMap<Vec<u8>, u32>, postings: &mut [Vec<u32>], tok: &[u8], doc_id: u32) {
+    if let Some(&tid) = map.get(tok) {
+        let p = &mut postings[tid as usize];
+        if p.last().copied() != Some(doc_id) { p.push(doc_id); }
+    }
+}
+
+#[cfg(unix)]
+fn read_docs(path: &Path) -> Vec<u8> {
+    use std::os::unix::fs::FileExt;
+    let f = File::open(path).expect("open docs.txt");
+    let len = f.metadata().expect("stat docs.txt").len() as usize;
+    let mut raw: Vec<u8> = vec![0u8; len];
+    if len > 0 {
+        let per = ((len + 3) / 4).max(1);
+        std::thread::scope(|s| {
+            for (i, chunk) in raw.chunks_mut(per).enumerate() {
+                let f = &f;
+                s.spawn(move || {
+                    f.read_exact_at(chunk, (i * per) as u64).expect("read docs.txt");
+                });
+            }
+        });
+    }
+    raw
+}
+
+#[cfg(not(unix))]
 fn read_docs(path: &Path) -> Vec<u8> {
     let mut f = File::open(path).expect("open docs.txt");
-    let len = f.metadata().map(|m| m.len() as usize).unwrap_or(270 * 1024 * 1024);
+    let len = f.metadata().map(|m| m.len() as usize).unwrap_or(0);
     let mut raw: Vec<u8> = Vec::with_capacity(len + 1);
     f.read_to_end(&mut raw).expect("read docs.txt");
     raw
@@ -197,7 +291,9 @@ fn load_corpus(raw: Vec<u8>, term_ids: &FastMap<Vec<u8>, u32>) -> (DocStore, Inv
     }
     byte_starts.push(raw.len());
 
-    type ChunkResult = (Vec<u8>, Vec<(u32, u32)>, Vec<Vec<u32>>);
+    assert!(raw.len() < u32::MAX as usize);
+
+    type ChunkResult = (Vec<(u32, u32)>, Vec<Vec<u32>>);
 
     let results: Vec<ChunkResult> = std::thread::scope(|s| {
         let raw_ref      = &raw[..];
@@ -211,72 +307,57 @@ fn load_corpus(raw: Vec<u8>, term_ids: &FastMap<Vec<u8>, u32>) -> (DocStore, Inv
             handles.push(s.spawn(move || {
                 let chunk = &raw_ref[bstart..bend];
                 let mut local_postings: Vec<Vec<u32>> = vec![Vec::new(); n_terms];
-                let mut norm_data: Vec<u8>     = Vec::with_capacity(chunk.len());
                 let mut spans: Vec<(u32, u32)> = Vec::with_capacity(chunk.len() / 40);
+                let mut tok: Vec<u8> = Vec::with_capacity(64);
                 let mut doc_id: u32 = 0;
+                let mut pos = 0usize;
 
                 for line in chunk.split(|&b| b == b'\n') {
+                    let line_off = pos;
+                    pos += line.len() + 1;
                     let line = if line.ends_with(b"\r") { &line[..line.len()-1] } else { line };
                     if line.is_empty() { continue; }
 
-                    let text = match line.iter().position(|&b| b == b'\t') {
-                        Some(t) => &line[t+1..],
-                        None    => b"",
+                    let ts = match line.iter().position(|&b| b == b'\t') {
+                        Some(t) => t + 1,
+                        None    => line.len(),
                     };
-
-                    let doc_start = norm_data.len() as u32;
-                    norm_data.push(b' ');
-
-                    let mut in_token = false;
-                    let mut tok_start = 0usize;
+                    let text = &line[ts..];
 
                     for &b in text {
                         let norm = trans_table[b as usize];
                         if norm != b' ' {
-                            if !in_token { in_token = true; tok_start = norm_data.len(); }
-                            norm_data.push(norm);
-                        } else if in_token {
-                            let tok = &norm_data[tok_start..];
-                            if let Some(&tid) = term_ids_ref.get(tok) {
-                                let p = &mut local_postings[tid as usize];
-                                if p.last().copied() != Some(doc_id) { p.push(doc_id); }
-                            }
-                            norm_data.push(b' ');
-                            in_token = false;
+                            tok.push(norm);
+                        } else if !tok.is_empty() {
+                            record(term_ids_ref, &mut local_postings, &tok, doc_id);
+                            tok.clear();
                         }
                     }
-                    if in_token {
-                        let tok = &norm_data[tok_start..];
-                        if let Some(&tid) = term_ids_ref.get(tok) {
-                            let p = &mut local_postings[tid as usize];
-                            if p.last().copied() != Some(doc_id) { p.push(doc_id); }
-                        }
-                        norm_data.push(b' ');
-                    } else if norm_data.len() as u32 == doc_start + 1 {
-                        norm_data.push(b' ');
+                    if !tok.is_empty() {
+                        record(term_ids_ref, &mut local_postings, &tok, doc_id);
+                        tok.clear();
                     }
 
-                    spans.push((doc_start, norm_data.len() as u32));
+                    let st = (bstart + line_off + ts) as u32;
+                    spans.push((st, st + text.len() as u32));
                     doc_id += 1;
                 }
-                (norm_data, spans, local_postings)
+                (spans, local_postings)
             }));
         }
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
-    drop(raw);
-
     let mut doc_id_starts: Vec<u32> = Vec::with_capacity(nthreads + 1);
     let mut cumulative: u32 = 0;
     doc_id_starts.push(0);
-    for (_, spans, _) in &results {
+    for (spans, _) in &results {
         cumulative += spans.len() as u32;
         doc_id_starts.push(cumulative);
     }
 
     let mut term_counts: Vec<u32> = vec![0; n_terms];
-    for (_, _, pp) in &results {
+    for (_, pp) in &results {
         for (tid, p) in pp.iter().enumerate() { term_counts[tid] += p.len() as u32; }
     }
     let mut inv_offsets: Vec<u32> = Vec::with_capacity(n_terms + 1);
@@ -286,19 +367,11 @@ fn load_corpus(raw: Vec<u8>, term_ids: &FastMap<Vec<u8>, u32>) -> (DocStore, Inv
     let mut doc_ids: Vec<u32> = vec![0u32; total as usize];
     let mut write_pos = inv_offsets[..n_terms].to_vec();
 
-    let total_docs  = doc_id_starts[nthreads] as usize;
-    let total_bytes: usize = results.iter().map(|(d, _, _)| d.len()).sum();
-    let mut flat_data: Vec<u8>       = Vec::with_capacity(total_bytes);
-    let mut all_spans: Vec<(u32,u32)> = vec![(0,0); total_docs];
+    let mut span_sets: Vec<Vec<(u32, u32)>> = Vec::with_capacity(nthreads);
 
-    for (ci, (norm_data, spans, pp)) in results.into_iter().enumerate() {
-        let base     = flat_data.len() as u32;
-        let doc_base = doc_id_starts[ci] as usize;
-        let doc_off  = doc_id_starts[ci];
-        for (li, (s, e)) in spans.into_iter().enumerate() {
-            all_spans[doc_base + li] = (base + s, base + e);
-        }
-        flat_data.extend_from_slice(&norm_data);
+    for (ci, (spans, pp)) in results.into_iter().enumerate() {
+        let doc_off = doc_id_starts[ci];
+        span_sets.push(spans);
         for (tid, postings) in pp.into_iter().enumerate() {
             let len = postings.len();
             if len > 0 {
@@ -309,7 +382,7 @@ fn load_corpus(raw: Vec<u8>, term_ids: &FastMap<Vec<u8>, u32>) -> (DocStore, Inv
         }
     }
 
-    (DocStore { data: flat_data, spans: all_spans },
+    (DocStore { raw, spans: span_sets, starts: doc_id_starts, trans: trans_table },
      InvertedIndex { doc_ids, offsets: inv_offsets })
 }
 
@@ -402,7 +475,7 @@ fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
 
 fn run_phrase(
     index: &InvertedIndex, doc_store: &DocStore, terms: &[u32], target: &[u8],
-    buf_a: &mut Vec<u32>, buf_b: &mut Vec<u32>, matches: &mut Vec<u32>,
+    buf_a: &mut Vec<u32>, buf_b: &mut Vec<u32>, matches: &mut Vec<u32>, scratch: &mut Vec<u8>,
 ) {
     matches.clear();
     let first = index.get(terms[0]);
@@ -416,7 +489,8 @@ fn run_phrase(
     }
     let candidates = if in_a { buf_a.as_slice() } else { buf_b.as_slice() };
     for &doc_id in candidates {
-        if contains_subslice(doc_store.get_doc(doc_id), target) { matches.push(doc_id); }
+        doc_store.normalize(doc_id, scratch);
+        if contains_subslice(scratch, target) { matches.push(doc_id); }
     }
 }
 
@@ -427,6 +501,16 @@ fn format_result<W: Write>(writer: &mut W, ids: &[u32]) {
     write!(writer, "{} {}", count, sum).unwrap();
     for &id in &ids[..count.min(10)] { write!(writer, " {}", id).unwrap(); }
     writeln!(writer).unwrap();
+}
+
+fn peak_rss_mb() -> u64 {
+    let s = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    for l in s.lines() {
+        if let Some(r) = l.strip_prefix("VmHWM:") {
+            return r.trim().trim_end_matches("kB").trim().parse::<u64>().unwrap_or(0) / 1024;
+        }
+    }
+    0
 }
 
 fn main() {
@@ -443,11 +527,14 @@ fn main() {
     let data_path = Path::new(&data_dir);
     let out_path  = Path::new(&out_dir);
 
+    let t0 = std::time::Instant::now();
+    let qraw = read_queries(&data_path.join(QUERIES_FILE));
+    let t_qread = t0.elapsed();
+
     let docs_path = data_path.join(DOCS_FILE);
     let reader = std::thread::spawn(move || read_docs(&docs_path));
 
-    let t0 = std::time::Instant::now();
-    let (mut queries, term_to_id) = extract_queries(&data_path.join(QUERIES_FILE));
+    let (mut queries, term_to_id) = extract_queries(&qraw);
     let t_queries = t0.elapsed();
 
     let t1 = std::time::Instant::now();
@@ -490,11 +577,12 @@ fn main() {
                 let mut buf_a: Vec<u32> = Vec::new();
                 let mut buf_b: Vec<u32> = Vec::new();
                 let mut pm:    Vec<u32> = Vec::new();
+                let mut scratch: Vec<u8> = Vec::new();
                 for q in chunk {
                     let terms = &terms_ref[q.t_off as usize..(q.t_off + q.t_len) as usize];
                     if q.phrase {
                         let target = &targets_ref[q.g_off as usize..(q.g_off + q.g_len) as usize];
-                        run_phrase(index_ref, doc_store_ref, terms, target, &mut buf_a, &mut buf_b, &mut pm);
+                        run_phrase(index_ref, doc_store_ref, terms, target, &mut buf_a, &mut buf_b, &mut pm, &mut scratch);
                         format_result(&mut out, &pm);
                     } else {
                         let ops = &ops_ref[q.o_off as usize..(q.o_off + q.t_len - 1) as usize];
@@ -512,6 +600,8 @@ fn main() {
     for buf in rendered { writer.write_all(&buf).expect("write"); }
     writer.flush().expect("flush");
 
+    eprintln!("[PROFILE2] Queries file read: {:?} | Distinct terms: {} | Queries: {}", t_qread, term_to_id.len(), queries.items.len());
     eprintln!("[PROFILE] Queries parse: {:?} | Docs read wait: {:?} | Corpus index: {:?} | Parallel query eval: {:?}",
         t_queries, t_wait, t_corpus, eval_dur);
+    eprintln!("[PROFILE3] Peak RSS: {} MB", peak_rss_mb());
 }
