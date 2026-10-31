@@ -474,7 +474,7 @@ fn run_bool<'a>(
     }
 }
 
-// Fast substring search on byte slice
+// Fast substring search on byte slice using vectorized first-byte search
 fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
     let n = needle.len();
     let h = haystack.len();
@@ -485,12 +485,20 @@ fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
         return false;
     }
     let first = needle[0];
-    let mut i = 0;
-    while i + n <= h {
-        if haystack[i] == first && &haystack[i..i + n] == needle {
-            return true;
+    let rest = &needle[1..];
+    let mut offset = 0;
+
+    while offset + n <= h {
+        let remaining = &haystack[offset..=h - n];
+        if let Some(pos) = remaining.iter().position(|&b| b == first) {
+            let match_pos = offset + pos;
+            if &haystack[match_pos + 1..match_pos + n] == rest {
+                return true;
+            }
+            offset = match_pos + 1;
+        } else {
+            break;
         }
-        i += 1;
     }
     false
 }
@@ -506,12 +514,8 @@ fn run_phrase(
 ) {
     matches.clear();
 
-    // Start with the rarest term to minimize candidate list immediately
-    let mut sorted_terms: Vec<u32> = terms.to_vec();
-    sorted_terms.sort_by_key(|&t| index[t as usize].len());
-    let slice = &sorted_terms;
-
-    let first = &index[slice[0] as usize];
+    // terms are pre-sorted rarest-first once after corpus indexing
+    let first = &index[terms[0] as usize];
     if first.is_empty() {
         return;
     }
@@ -520,7 +524,7 @@ fn run_phrase(
     buf_a.extend_from_slice(first);
     let mut current_in_a = true;
 
-    for &term_id in &slice[1..] {
+    for &term_id in &terms[1..] {
         let postings = &index[term_id as usize];
         if current_in_a {
             if buf_a.is_empty() {
@@ -592,12 +596,19 @@ fn main() {
     let out_path = Path::new(&out_dir);
 
     let t0 = std::time::Instant::now();
-    let (queries, term_to_id) = extract_queries(&data_path.join(QUERIES_FILE));
+    let (mut queries, term_to_id) = extract_queries(&data_path.join(QUERIES_FILE));
     let t_queries = t0.elapsed();
 
     let t1 = std::time::Instant::now();
     let (doc_arena, index) = load_corpus(&data_path.join(DOCS_FILE), &term_to_id);
     let t_corpus = t1.elapsed();
+
+    // Pre-sort phrase query terms by posting length (rarest first) once
+    for query in &mut queries {
+        if let Query::Phrase { terms, .. } = query {
+            terms.sort_by_key(|&t| index[t as usize].len());
+        }
+    }
 
     std::fs::create_dir_all(out_path).expect("Failed to create out directory");
     let out_file = File::create(out_path.join(RESULTS_FILE)).expect("Failed to create results.txt");
