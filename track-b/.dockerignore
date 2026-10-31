@@ -1,0 +1,7 @@
+target/
+data/
+.data/
+out/
+.out/
+.git/
+

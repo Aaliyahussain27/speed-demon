@@ -4,26 +4,27 @@ The task, the input files and the exact output format are in the [spec](https://
 
 ## Approach
 
-Our solution replaces the naive inverted index and unindexed candidate re-tokenization with an optimized, memory-efficient search architecture:
+Our solution is implemented in **Rust (2021 edition)**, reproducing and amplifying the optimizations established in the Python prototype:
 
-1. **Pre-Query Analysis & Query-Targeted Indexing**:
-   Because `queries.txt` is available alongside `docs.txt`, we parse all 50,000 queries first and harvest the vocabulary of needed terms (11,430 unique query terms in the sample dataset out of 378,185 corpus terms). Documents are indexed *only* for terms that appear in at least one query, discarding 97% of corpus terms and slashing memory allocations and dictionary lookups.
+1. **Query-Targeted Posting Indexing**:
+   Because `queries.txt` is available alongside `docs.txt`, we parse all queries first and extract only the vocabulary of requested terms. The inverted index stores postings *strictly* for terms appearing in at least one query, discarding over 97% of corpus terms and radically reducing memory and cache pressure.
 
-2. **C-Speed Byte Translation**:
-   Instead of compiling and executing Python regular expressions (`TOKEN_RE.findall(text.lower())`) on each document line, we construct a 256-byte ASCII mapping table that folds `A-Z` to `a-z`, preserves `[a-z0-9]`, `\t`, and `\n`, and converts every other byte into a space `0x20`. Translating the raw bytes directly runs at C speed via `bytes.translate`.
+2. **Zero-Overhead ASCII Mapping & Tokenization**:
+   Instead of regular expressions or Unicode case-folding, we construct a 256-element byte mapping table that folds ASCII uppercase `[A-Z]` to `[a-z]`, keeps `[a-z0-9]`, and treats all other bytes (including UTF-8 continuation bytes $\ge 0x80$) as separators (0x20).
 
-3. **Normalized Substring Search for Phrase Queries**:
-   The reference implementation re-tokenized raw document text from scratch for every candidate document across all phrase queries. We cache normalized, single-space document representations (`b' ' + b' '.join(words) + b' '`). This guarantees that matching a phrase query `"t1 t2 ... tk"` is equivalent to searching for `b' ' + b' '.join(terms) + b' '` using Python's highly optimized Boyer-Moore-Horspool C-level `bytes.__contains__` search.
+3. **Sorted Vectors for Posting Lists**:
+   Documents are processed in sequential order `0..N-1`. Postings are stored directly as contiguous, sorted `Vec<u32>` slices. This eliminates hash set overhead and allows Boolean `AND`, `OR`, and `NOT` operations to run via $O(N+M)$ cache-friendly two-pointer merge scans with early termination.
 
-4. **Early-Exit Boolean & Phrase Candidate Pruning**:
-   In both Boolean chains and Phrase queries, intermediate set operations check for emptiness early (`if not candidates: return []`), terminating evaluation immediately when no matches remain.
+4. **Normalized Space-Padded Phrase Search**:
+   Phrase queries search against pre-normalized, space-delimited byte representations of candidate documents using slice window matching.
 
 ## Dependencies
 
-None. Python standard library only (`sys`, `os`, `argparse`).
+Zero external crates (`dependency_count = 0`). Standard library only (`std::collections`, `std::fs`, `std::io`, `std::env`).
 
-## With another 24 hours
+## Build & Run
 
-1. Multi-threaded / multiprocessing document ingestion across multiple CPU cores.
-2. Roaring bitmaps or SIMD bitset vectorization for posting list intersections.
-3. Positional inverted index with delta-encoded integer arrays.
+```bash
+cargo build --release
+./target/release/solution --data /data --out /out
+```

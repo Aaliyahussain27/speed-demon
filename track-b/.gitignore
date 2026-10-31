@@ -1,6 +1,4 @@
 .out/
 .data/
-data/
-generators/
 __pycache__/
 *.pyc

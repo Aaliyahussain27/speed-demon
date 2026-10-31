@@ -1,0 +1,414 @@
+use std::collections::{HashMap, HashSet};
+use std::env;
+use std::fs::File;
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+use std::path::Path;
+
+const DOCS_FILE: &str = "docs.txt";
+const QUERIES_FILE: &str = "queries.txt";
+const RESULTS_FILE: &str = "results.txt";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Op {
+    And,
+    Or,
+    Not,
+}
+
+enum Query {
+    Bool(Vec<Vec<u8>>, Vec<Op>),
+    Phrase(Vec<Vec<u8>>),
+}
+
+// 256-byte ASCII mapping table:
+// 'A'..='Z' -> 'a'..='z', 'a'..='z' and '0'..='9' kept, all others -> b' ' (0x20)
+fn build_trans_table() -> [u8; 256] {
+    let mut table = [b' '; 256];
+    for b in b'0'..=b'9' {
+        table[b as usize] = b;
+    }
+    for b in b'a'..=b'z' {
+        table[b as usize] = b;
+    }
+    for b in b'A'..=b'Z' {
+        table[b as usize] = b + 32;
+    }
+    table
+}
+
+// Fast byte tokenization using space-separated runs
+fn tokenize_translated(bytes: &[u8]) -> Vec<&[u8]> {
+    let mut tokens = Vec::new();
+    let mut start = None;
+    for (i, &b) in bytes.iter().enumerate() {
+        if b != b' ' {
+            if start.is_none() {
+                start = Some(i);
+            }
+        } else if let Some(s) = start {
+            tokens.push(&bytes[s..i]);
+            start = None;
+        }
+    }
+    if let Some(s) = start {
+        tokens.push(&bytes[s..]);
+    }
+    tokens
+}
+
+fn extract_queries(path: &Path) -> (Vec<Query>, HashSet<Vec<u8>>) {
+    let file = File::open(path).expect("Failed to open queries.txt");
+    let reader = BufReader::new(file);
+
+    let mut queries = Vec::new();
+    let mut needed_terms = HashSet::new();
+
+    for line in reader.split(b'\n') {
+        let mut line = line.expect("Failed to read line");
+        if line.ends_with(b"\r") {
+            line.pop();
+        }
+        if line.is_empty() {
+            continue;
+        }
+
+        let first_space = line.iter().position(|&b| b == b' ');
+        if let Some(pos) = first_space {
+            let kind = &line[..pos];
+            let rest = &line[pos + 1..];
+
+            if kind == b"BOOL" {
+                let parts: Vec<&[u8]> = rest.split(|&b| b == b' ').collect();
+                let mut terms = Vec::with_capacity((parts.len() + 1) / 2);
+                let mut ops = Vec::with_capacity(parts.len() / 2);
+
+                terms.push(parts[0].to_vec());
+                needed_terms.insert(parts[0].to_vec());
+
+                let mut i = 1;
+                while i < parts.len() {
+                    let op = match parts[i] {
+                        b"AND" => Op::And,
+                        b"OR" => Op::Or,
+                        b"NOT" => Op::Not,
+                        _ => panic!("Unknown operator {:?}", parts[i]),
+                    };
+                    ops.push(op);
+                    let term = parts[i + 1].to_vec();
+                    needed_terms.insert(term.clone());
+                    terms.push(term);
+                    i += 2;
+                }
+                queries.push(Query::Bool(terms, ops));
+            } else if kind == b"PHRASE" {
+                // Remove outer quotes: "term1 term2 ... termk"
+                let inner = if rest.starts_with(b"\"") && rest.ends_with(b"\"") {
+                    &rest[1..rest.len() - 1]
+                } else {
+                    rest
+                };
+                let terms: Vec<Vec<u8>> = inner
+                    .split(|&b| b == b' ')
+                    .map(|s| {
+                        needed_terms.insert(s.to_vec());
+                        s.to_vec()
+                    })
+                    .collect();
+                queries.push(Query::Phrase(terms));
+            }
+        }
+    }
+
+    (queries, needed_terms)
+}
+
+fn load_corpus(
+    path: &Path,
+    needed_terms: &HashSet<Vec<u8>>,
+) -> (Vec<Vec<u8>>, HashMap<Vec<u8>, Vec<u32>>) {
+    let mut file = File::open(path).expect("Failed to open docs.txt");
+    let mut buffer = Vec::new();
+    file.read_to_end(&mut buffer).expect("Failed to read docs.txt");
+
+    let trans_table = build_trans_table();
+
+    let mut index: HashMap<Vec<u8>, Vec<u32>> = HashMap::with_capacity(needed_terms.len());
+    for term in needed_terms {
+        index.insert(term.clone(), Vec::new());
+    }
+
+    let mut norm_docs = Vec::new();
+    let mut doc_seen: HashSet<&[u8]> = HashSet::new();
+
+    let mut start = 0;
+    let mut doc_id: u32 = 0;
+
+    while start < buffer.len() {
+        let end = buffer[start..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map(|p| start + p)
+            .unwrap_or(buffer.len());
+
+        let mut line = &buffer[start..end];
+        if line.ends_with(b"\r") {
+            line = &line[..line.len() - 1];
+        }
+
+        let tab_pos = line.iter().position(|&b| b == b'\t');
+        let text = if let Some(t) = tab_pos {
+            &line[t + 1..]
+        } else {
+            b""
+        };
+
+        // Translate text into normalized byte vector
+        let mut clean = Vec::with_capacity(text.len() + 2);
+        clean.push(b' ');
+        for &b in text {
+            clean.push(trans_table[b as usize]);
+        }
+        clean.push(b' ');
+
+        let tokens = tokenize_translated(&clean);
+
+        // Deduplicate tokens for this document
+        doc_seen.clear();
+        for &tok in &tokens {
+            if doc_seen.insert(tok) {
+                if let Some(postings) = index.get_mut(tok) {
+                    postings.push(doc_id);
+                }
+            }
+        }
+
+        // Store space-collapsed normalized doc for fast substring phrase matching
+        let mut compact_doc = Vec::new();
+        compact_doc.push(b' ');
+        for (i, &tok) in tokens.iter().enumerate() {
+            if i > 0 {
+                compact_doc.push(b' ');
+            }
+            compact_doc.extend_from_slice(tok);
+        }
+        compact_doc.push(b' ');
+
+        norm_docs.push(compact_doc);
+
+        doc_id += 1;
+        start = end + 1;
+    }
+
+    (norm_docs, index)
+}
+
+fn intersect(a: &[u32], b: &[u32]) -> Vec<u32> {
+    let mut res = Vec::new();
+    let mut i = 0;
+    let mut j = 0;
+    let na = a.len();
+    let nb = b.len();
+    while i < na && j < nb {
+        let va = a[i];
+        let vb = b[j];
+        if va == vb {
+            res.push(va);
+            i += 1;
+            j += 1;
+        } else if va < vb {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    res
+}
+
+fn union(a: &[u32], b: &[u32]) -> Vec<u32> {
+    let mut res = Vec::with_capacity(a.len() + b.len());
+    let mut i = 0;
+    let mut j = 0;
+    let na = a.len();
+    let nb = b.len();
+    while i < na && j < nb {
+        let va = a[i];
+        let vb = b[j];
+        if va == vb {
+            res.push(va);
+            i += 1;
+            j += 1;
+        } else if va < vb {
+            res.push(va);
+            i += 1;
+        } else {
+            res.push(vb);
+            j += 1;
+        }
+    }
+    if i < na {
+        res.extend_from_slice(&a[i..]);
+    } else if j < nb {
+        res.extend_from_slice(&b[j..]);
+    }
+    res
+}
+
+fn difference(a: &[u32], b: &[u32]) -> Vec<u32> {
+    let mut res = Vec::new();
+    let mut i = 0;
+    let mut j = 0;
+    let na = a.len();
+    let nb = b.len();
+    while i < na && j < nb {
+        let va = a[i];
+        let vb = b[j];
+        if va == vb {
+            i += 1;
+            j += 1;
+        } else if va < vb {
+            res.push(va);
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    if i < na {
+        res.extend_from_slice(&a[i..]);
+    }
+    res
+}
+
+fn run_bool(
+    index: &HashMap<Vec<u8>, Vec<u32>>,
+    terms: &[Vec<u8>],
+    ops: &[Op],
+) -> Vec<u32> {
+    let empty = Vec::new();
+    let mut running = index.get(&terms[0]).unwrap_or(&empty).clone();
+
+    for (op, term) in ops.iter().zip(terms[1..].iter()) {
+        let postings = index.get(term).unwrap_or(&empty);
+        match op {
+            Op::And => {
+                if running.is_empty() {
+                    return running;
+                }
+                running = intersect(&running, postings);
+            }
+            Op::Or => {
+                running = union(&running, postings);
+            }
+            Op::Not => {
+                if running.is_empty() {
+                    return running;
+                }
+                running = difference(&running, postings);
+            }
+        }
+    }
+    running
+}
+
+fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if haystack.len() < needle.len() {
+        return false;
+    }
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+fn run_phrase(
+    index: &HashMap<Vec<u8>, Vec<u32>>,
+    norm_docs: &[Vec<u8>],
+    terms: &[Vec<u8>],
+) -> Vec<u32> {
+    let empty = Vec::new();
+    let mut candidates = index.get(&terms[0]).unwrap_or(&empty).clone();
+    for term in &terms[1..] {
+        let postings = index.get(term).unwrap_or(&empty);
+        candidates = intersect(&candidates, postings);
+        if candidates.is_empty() {
+            return Vec::new();
+        }
+    }
+
+    // Target sequence: b" term1 term2 ... termk "
+    let mut target = Vec::new();
+    target.push(b' ');
+    for (i, t) in terms.iter().enumerate() {
+        if i > 0 {
+            target.push(b' ');
+        }
+        target.extend_from_slice(t);
+    }
+    target.push(b' ');
+
+    let mut matches = Vec::new();
+    for &doc_id in &candidates {
+        if contains_subslice(&norm_docs[doc_id as usize], &target) {
+            matches.push(doc_id);
+        }
+    }
+    matches
+}
+
+fn format_result<W: Write>(writer: &mut W, ids: &[u32]) {
+    if ids.is_empty() {
+        writeln!(writer, "0 0").unwrap();
+        return;
+    }
+    let count = ids.len();
+    let sum: u64 = ids.iter().map(|&x| x as u64).sum();
+    write!(writer, "{} {}", count, sum).unwrap();
+
+    let take = count.min(10);
+    for &id in &ids[..take] {
+        write!(writer, " {}", id).unwrap();
+    }
+    writeln!(writer).unwrap();
+}
+
+fn main() {
+    let args: Vec<String> = env::args().collect();
+    let mut data_dir = "/data".to_string();
+    let mut out_dir = "/out".to_string();
+
+    let mut i = 1;
+    while i < args.len() {
+        if args[i] == "--data" && i + 1 < args.len() {
+            data_dir = args[i + 1].clone();
+            i += 2;
+        } else if args[i] == "--out" && i + 1 < args.len() {
+            out_dir = args[i + 1].clone();
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+
+    let data_path = Path::new(&data_dir);
+    let out_path = Path::new(&out_dir);
+
+    let (queries, needed_terms) = extract_queries(&data_path.join(QUERIES_FILE));
+    let (norm_docs, index) = load_corpus(&data_path.join(DOCS_FILE), &needed_terms);
+
+    std::fs::create_dir_all(out_path).expect("Failed to create out directory");
+    let out_file = File::create(out_path.join(RESULTS_FILE)).expect("Failed to create results.txt");
+    let mut writer = BufWriter::new(out_file);
+
+    for query in &queries {
+        match query {
+            Query::Bool(terms, ops) => {
+                let res = run_bool(&index, terms, ops);
+                format_result(&mut writer, &res);
+            }
+            Query::Phrase(terms) => {
+                let res = run_phrase(&index, &norm_docs, terms);
+                format_result(&mut writer, &res);
+            }
+        }
+    }
+}
+
