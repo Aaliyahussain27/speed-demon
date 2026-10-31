@@ -138,15 +138,15 @@ fn extract_queries(path: &Path) -> (Vec<Query>, HashMap<Vec<u8>, u32>) {
 }
 
 struct DocArena {
-    data: Vec<u8>,
-    offsets: Vec<(u32, u32)>,
+    chunks: Vec<Vec<u8>>,
+    offsets: Vec<(u8, u32, u32)>,
 }
 
 impl DocArena {
     #[inline(always)]
     fn get_doc(&self, id: u32) -> &[u8] {
-        let (start, end) = self.offsets[id as usize];
-        &self.data[start as usize..end as usize]
+        let (chunk_idx, start, end) = self.offsets[id as usize];
+        &self.chunks[chunk_idx as usize][start as usize..end as usize]
     }
 }
 
@@ -272,15 +272,15 @@ fn load_corpus(
     drop(raw);
 
     // --- Merge phase ---
-    let mut merged_data: Vec<u8> = Vec::with_capacity(32 * 1024 * 1024);
-    let mut merged_offsets: Vec<(u32, u32)> = Vec::with_capacity(250_000);
+    let mut chunks: Vec<Vec<u8>> = Vec::with_capacity(results.len());
+    let mut offsets: Vec<(u8, u32, u32)> = Vec::with_capacity(250_000);
     let mut final_postings: Vec<Vec<u32>> = vec![Vec::new(); n_terms];
 
-    for (partial_data, partial_offsets, partial_postings) in results {
-        let base = merged_data.len() as u32;
-        merged_data.extend_from_slice(&partial_data);
+    for (chunk_idx, (partial_data, partial_offsets, partial_postings)) in results.into_iter().enumerate() {
+        let c_idx = chunk_idx as u8;
+        chunks.push(partial_data);
         for (s, e) in partial_offsets {
-            merged_offsets.push((s + base, e + base));
+            offsets.push((c_idx, s, e));
         }
         for (tid, postings) in partial_postings.into_iter().enumerate() {
             if !postings.is_empty() {
@@ -291,30 +291,66 @@ fn load_corpus(
 
     (
         DocArena {
-            data: merged_data,
-            offsets: merged_offsets,
+            chunks,
+            offsets,
         },
         final_postings,
     )
 }
 
-fn intersect(a: &[u32], b: &[u32], out: &mut Vec<u32>) {
+#[inline(always)]
+fn gallop(slice: &[u32], target: u32) -> usize {
+    let n = slice.len();
+    if n == 0 || slice[0] >= target {
+        return 0;
+    }
+    let mut step = 1;
+    let mut prev = 0;
+    while step < n && slice[step] < target {
+        prev = step;
+        step <<= 1;
+    }
+    let high = step.min(n);
+    let mut low = prev;
+    let mut len = high - low;
+    while len > 0 {
+        let half = len / 2;
+        let mid = low + half;
+        if slice[mid] < target {
+            low = mid + 1;
+            len -= half + 1;
+        } else {
+            len = half;
+        }
+    }
+    low
+}
+
+fn intersect(mut a: &[u32], mut b: &[u32], out: &mut Vec<u32>) {
     out.clear();
-    let mut i = 0;
-    let mut j = 0;
-    let na = a.len();
-    let nb = b.len();
-    while i < na && j < nb {
-        let va = a[i];
-        let vb = b[j];
+    out.reserve(a.len().min(b.len()));
+
+    while !a.is_empty() && !b.is_empty() {
+        let va = a[0];
+        let vb = b[0];
         if va == vb {
             out.push(va);
-            i += 1;
-            j += 1;
+            a = &a[1..];
+            b = &b[1..];
         } else if va < vb {
-            i += 1;
+            if a.len() > 16 * b.len() {
+                let idx = gallop(a, vb);
+                a = &a[idx..];
+            } else {
+                a = &a[1..];
+            }
         } else {
-            j += 1;
+            if b.len() > 16 * a.len() {
+                let idx = gallop(b, va);
+                b = &b[idx..];
+            } else {
+                b = &b[1..];
+            }
         }
     }
 }
@@ -348,27 +384,30 @@ fn union(a: &[u32], b: &[u32], out: &mut Vec<u32>) {
     }
 }
 
-fn difference(a: &[u32], b: &[u32], out: &mut Vec<u32>) {
+fn difference(mut a: &[u32], mut b: &[u32], out: &mut Vec<u32>) {
     out.clear();
-    let mut i = 0;
-    let mut j = 0;
-    let na = a.len();
-    let nb = b.len();
-    while i < na && j < nb {
-        let va = a[i];
-        let vb = b[j];
+    out.reserve(a.len());
+
+    while !a.is_empty() && !b.is_empty() {
+        let va = a[0];
+        let vb = b[0];
         if va == vb {
-            i += 1;
-            j += 1;
+            a = &a[1..];
+            b = &b[1..];
         } else if va < vb {
             out.push(va);
-            i += 1;
+            a = &a[1..];
         } else {
-            j += 1;
+            if b.len() > 16 * a.len() {
+                let idx = gallop(b, va);
+                b = &b[idx..];
+            } else {
+                b = &b[1..];
+            }
         }
     }
-    if i < na {
-        out.extend_from_slice(&a[i..]);
+    if !a.is_empty() {
+        out.extend_from_slice(a);
     }
 }
 
