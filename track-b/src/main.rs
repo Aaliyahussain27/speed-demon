@@ -119,10 +119,23 @@ fn extract_queries(path: &Path) -> (Vec<Query>, HashSet<Vec<u8>>) {
     (queries, needed_terms)
 }
 
+struct DocArena {
+    data: Vec<u8>,
+    offsets: Vec<(u32, u32)>,
+}
+
+impl DocArena {
+    #[inline(always)]
+    fn get_doc(&self, id: u32) -> &[u8] {
+        let (start, end) = self.offsets[id as usize];
+        &self.data[start as usize..end as usize]
+    }
+}
+
 fn load_corpus(
     path: &Path,
     needed_terms: &HashSet<Vec<u8>>,
-) -> (Vec<Vec<u8>>, HashMap<Vec<u8>, Vec<u32>>) {
+) -> (DocArena, HashMap<Vec<u8>, Vec<u32>>) {
     let file = File::open(path).expect("Failed to open docs.txt");
     let reader = BufReader::with_capacity(1024 * 1024, file);
 
@@ -133,9 +146,10 @@ fn load_corpus(
         index.insert(term.clone(), Vec::new());
     }
 
-    let mut norm_docs = Vec::new();
+    let mut arena_data = Vec::with_capacity(32 * 1024 * 1024);
+    let mut arena_offsets = Vec::with_capacity(250_000);
+
     let mut clean = Vec::new();
-    let mut compact_doc = Vec::new();
     let mut doc_id: u32 = 0;
 
     for line in reader.split(b'\n') {
@@ -162,37 +176,41 @@ fn load_corpus(
         }
         clean.push(b' ');
 
-        compact_doc.clear();
-        compact_doc.push(b' ');
+        let start_offset = arena_data.len() as u32;
+        arena_data.push(b' ');
 
         let mut first = true;
-        {
-            let mut doc_seen: HashSet<&[u8]> = HashSet::new();
-            for_each_token(&clean, |tok| {
-                if doc_seen.insert(tok) {
-                    if let Some(postings) = index.get_mut(tok) {
-                        postings.push(doc_id);
-                    }
+        for_each_token(&clean, |tok| {
+            if let Some(postings) = index.get_mut(tok) {
+                if postings.last().copied() != Some(doc_id) {
+                    postings.push(doc_id);
                 }
-                if !first {
-                    compact_doc.push(b' ');
-                }
-                compact_doc.extend_from_slice(tok);
-                first = false;
-            });
-        }
+            }
+            if !first {
+                arena_data.push(b' ');
+            }
+            arena_data.extend_from_slice(tok);
+            first = false;
+        });
 
-        compact_doc.push(b' ');
-        norm_docs.push(compact_doc.clone());
+        arena_data.push(b' ');
+        let end_offset = arena_data.len() as u32;
+        arena_offsets.push((start_offset, end_offset));
 
         doc_id += 1;
     }
 
-    (norm_docs, index)
+    (
+        DocArena {
+            data: arena_data,
+            offsets: arena_offsets,
+        },
+        index,
+    )
 }
 
-fn intersect(a: &[u32], b: &[u32]) -> Vec<u32> {
-    let mut res = Vec::new();
+fn intersect(a: &[u32], b: &[u32], out: &mut Vec<u32>) {
+    out.clear();
     let mut i = 0;
     let mut j = 0;
     let na = a.len();
@@ -201,7 +219,7 @@ fn intersect(a: &[u32], b: &[u32]) -> Vec<u32> {
         let va = a[i];
         let vb = b[j];
         if va == vb {
-            res.push(va);
+            out.push(va);
             i += 1;
             j += 1;
         } else if va < vb {
@@ -210,11 +228,11 @@ fn intersect(a: &[u32], b: &[u32]) -> Vec<u32> {
             j += 1;
         }
     }
-    res
 }
 
-fn union(a: &[u32], b: &[u32]) -> Vec<u32> {
-    let mut res = Vec::with_capacity(a.len() + b.len());
+fn union(a: &[u32], b: &[u32], out: &mut Vec<u32>) {
+    out.clear();
+    out.reserve(a.len() + b.len());
     let mut i = 0;
     let mut j = 0;
     let na = a.len();
@@ -223,27 +241,26 @@ fn union(a: &[u32], b: &[u32]) -> Vec<u32> {
         let va = a[i];
         let vb = b[j];
         if va == vb {
-            res.push(va);
+            out.push(va);
             i += 1;
             j += 1;
         } else if va < vb {
-            res.push(va);
+            out.push(va);
             i += 1;
         } else {
-            res.push(vb);
+            out.push(vb);
             j += 1;
         }
     }
     if i < na {
-        res.extend_from_slice(&a[i..]);
+        out.extend_from_slice(&a[i..]);
     } else if j < nb {
-        res.extend_from_slice(&b[j..]);
+        out.extend_from_slice(&b[j..]);
     }
-    res
 }
 
-fn difference(a: &[u32], b: &[u32]) -> Vec<u32> {
-    let mut res = Vec::new();
+fn difference(a: &[u32], b: &[u32], out: &mut Vec<u32>) {
+    out.clear();
     let mut i = 0;
     let mut j = 0;
     let na = a.len();
@@ -255,47 +272,86 @@ fn difference(a: &[u32], b: &[u32]) -> Vec<u32> {
             i += 1;
             j += 1;
         } else if va < vb {
-            res.push(va);
+            out.push(va);
             i += 1;
         } else {
             j += 1;
         }
     }
     if i < na {
-        res.extend_from_slice(&a[i..]);
+        out.extend_from_slice(&a[i..]);
     }
-    res
 }
 
-fn run_bool(
-    index: &HashMap<Vec<u8>, Vec<u32>>,
+fn run_bool<'a>(
+    index: &'a HashMap<Vec<u8>, Vec<u32>>,
     terms: &[Vec<u8>],
     ops: &[Op],
-) -> Vec<u32> {
-    let empty = Vec::new();
-    let mut running = index.get(&terms[0]).unwrap_or(&empty).clone();
+    buf_a: &'a mut Vec<u32>,
+    buf_b: &'a mut Vec<u32>,
+) -> &'a [u32] {
+    let empty = &[];
+    let first = index.get(&terms[0]).map(|v| v.as_slice()).unwrap_or(empty);
+
+    if ops.is_empty() {
+        return first;
+    }
+
+    buf_a.clear();
+    buf_a.extend_from_slice(first);
+
+    let mut current_in_a = true;
 
     for (op, term) in ops.iter().zip(terms[1..].iter()) {
-        let postings = index.get(term).unwrap_or(&empty);
+        let postings = index.get(term).map(|v| v.as_slice()).unwrap_or(empty);
         match op {
             Op::And => {
-                if running.is_empty() {
-                    continue;
+                if current_in_a {
+                    if buf_a.is_empty() {
+                        continue;
+                    }
+                    intersect(buf_a, postings, buf_b);
+                    current_in_a = false;
+                } else {
+                    if buf_b.is_empty() {
+                        continue;
+                    }
+                    intersect(buf_b, postings, buf_a);
+                    current_in_a = true;
                 }
-                running = intersect(&running, postings);
             }
             Op::Or => {
-                running = union(&running, postings);
+                if current_in_a {
+                    union(buf_a, postings, buf_b);
+                    current_in_a = false;
+                } else {
+                    union(buf_b, postings, buf_a);
+                    current_in_a = true;
+                }
             }
             Op::Not => {
-                if running.is_empty() {
-                    continue;
+                if current_in_a {
+                    if buf_a.is_empty() {
+                        continue;
+                    }
+                    difference(buf_a, postings, buf_b);
+                    current_in_a = false;
+                } else {
+                    if buf_b.is_empty() {
+                        continue;
+                    }
+                    difference(buf_b, postings, buf_a);
+                    current_in_a = true;
                 }
-                running = difference(&running, postings);
             }
         }
     }
-    running
+
+    if current_in_a {
+        buf_a.as_slice()
+    } else {
+        buf_b.as_slice()
+    }
 }
 
 // Fast substring search on byte slice
@@ -321,26 +377,53 @@ fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
 
 fn run_phrase(
     index: &HashMap<Vec<u8>, Vec<u32>>,
-    norm_docs: &[Vec<u8>],
+    doc_arena: &DocArena,
     terms: &[Vec<u8>],
-) -> Vec<u32> {
-    let empty = Vec::new();
+    buf_a: &mut Vec<u32>,
+    buf_b: &mut Vec<u32>,
+    matches: &mut Vec<u32>,
+) {
+    matches.clear();
+    let empty = &[];
 
     // Start with the rarest term to minimize candidate list immediately
     let mut sorted_terms: Vec<&Vec<u8>> = terms.iter().collect();
     sorted_terms.sort_by_key(|t| index.get(*t).map_or(0, |p| p.len()));
 
-    let mut candidates = index.get(sorted_terms[0]).unwrap_or(&empty).clone();
-    if candidates.is_empty() {
-        return Vec::new();
+    let first = index.get(sorted_terms[0]).map(|v| v.as_slice()).unwrap_or(empty);
+    if first.is_empty() {
+        return;
     }
 
+    buf_a.clear();
+    buf_a.extend_from_slice(first);
+    let mut current_in_a = true;
+
     for term in &sorted_terms[1..] {
-        let postings = index.get(*term).unwrap_or(&empty);
-        candidates = intersect(&candidates, postings);
-        if candidates.is_empty() {
-            return Vec::new();
+        let postings = index.get(*term).map(|v| v.as_slice()).unwrap_or(empty);
+        if current_in_a {
+            if buf_a.is_empty() {
+                return;
+            }
+            intersect(buf_a, postings, buf_b);
+            current_in_a = false;
+        } else {
+            if buf_b.is_empty() {
+                return;
+            }
+            intersect(buf_b, postings, buf_a);
+            current_in_a = true;
         }
+    }
+
+    let candidates = if current_in_a {
+        buf_a.as_slice()
+    } else {
+        buf_b.as_slice()
+    };
+
+    if candidates.is_empty() {
+        return;
     }
 
     let mut target = Vec::new();
@@ -353,13 +436,11 @@ fn run_phrase(
     }
     target.push(b' ');
 
-    let mut matches = Vec::new();
-    for &doc_id in &candidates {
-        if contains_subslice(&norm_docs[doc_id as usize], &target) {
+    for &doc_id in candidates {
+        if contains_subslice(doc_arena.get_doc(doc_id), &target) {
             matches.push(doc_id);
         }
     }
-    matches
 }
 
 fn format_result<W: Write>(writer: &mut W, ids: &[u32]) {
@@ -399,23 +480,44 @@ fn main() {
     let data_path = Path::new(&data_dir);
     let out_path = Path::new(&out_dir);
 
+    let t0 = std::time::Instant::now();
     let (queries, needed_terms) = extract_queries(&data_path.join(QUERIES_FILE));
-    let (norm_docs, index) = load_corpus(&data_path.join(DOCS_FILE), &needed_terms);
+    let t_queries = t0.elapsed();
+
+    let t1 = std::time::Instant::now();
+    let (doc_arena, index) = load_corpus(&data_path.join(DOCS_FILE), &needed_terms);
+    let t_corpus = t1.elapsed();
 
     std::fs::create_dir_all(out_path).expect("Failed to create out directory");
     let out_file = File::create(out_path.join(RESULTS_FILE)).expect("Failed to create results.txt");
     let mut writer = BufWriter::new(out_file);
 
+    let mut bool_dur = std::time::Duration::ZERO;
+    let mut phrase_dur = std::time::Duration::ZERO;
+
+    let mut buf_a: Vec<u32> = Vec::new();
+    let mut buf_b: Vec<u32> = Vec::new();
+    let mut phrase_matches: Vec<u32> = Vec::new();
+
     for query in &queries {
         match query {
             Query::Bool(terms, ops) => {
-                let res = run_bool(&index, terms, ops);
-                format_result(&mut writer, &res);
+                let q_start = std::time::Instant::now();
+                let res = run_bool(&index, terms, ops, &mut buf_a, &mut buf_b);
+                bool_dur += q_start.elapsed();
+                format_result(&mut writer, res);
             }
             Query::Phrase(terms) => {
-                let res = run_phrase(&index, &norm_docs, terms);
-                format_result(&mut writer, &res);
+                let q_start = std::time::Instant::now();
+                run_phrase(&index, &doc_arena, terms, &mut buf_a, &mut buf_b, &mut phrase_matches);
+                phrase_dur += q_start.elapsed();
+                format_result(&mut writer, &phrase_matches);
             }
         }
     }
+
+    eprintln!(
+        "[PROFILE] Queries parse: {:?} | Corpus index: {:?} | BOOL eval: {:?} | PHRASE eval: {:?}",
+        t_queries, t_corpus, bool_dur, phrase_dur
+    );
 }
