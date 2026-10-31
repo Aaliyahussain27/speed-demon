@@ -258,10 +258,31 @@ impl DocStore {
 }
 
 #[inline(always)]
-fn record(map: &FastMap<Vec<u8>, u32>, postings: &mut [Vec<u32>], tok: &[u8], doc_id: u32) {
-    if let Some(&tid) = map.get(tok) {
-        let p = &mut postings[tid as usize];
-        if p.last().copied() != Some(doc_id) { p.push(doc_id); }
+fn for_each_token<F: FnMut(&[u8])>(text: &[u8], trans: &[u8; 256], tok: &mut Vec<u8>, mut f: F) {
+    for &b in text {
+        let norm = trans[b as usize];
+        if norm != b' ' {
+            tok.push(norm);
+        } else if !tok.is_empty() {
+            f(&tok[..]);
+            tok.clear();
+        }
+    }
+    if !tok.is_empty() {
+        f(&tok[..]);
+        tok.clear();
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SharedOut(*mut u32, usize);
+unsafe impl Send for SharedOut {}
+unsafe impl Sync for SharedOut {}
+impl SharedOut {
+    #[inline(always)]
+    fn write(&self, i: usize, v: u32) {
+        assert!(i < self.1);
+        unsafe { *self.0.add(i) = v; }
     }
 }
 
@@ -311,9 +332,9 @@ fn load_corpus(raw: Vec<u8>, term_ids: &FastMap<Vec<u8>, u32>) -> (DocStore, Inv
 
     assert!(raw.len() < u32::MAX as usize);
 
-    type ChunkResult = (Vec<(u32, u32)>, Vec<Vec<u32>>);
+    type PassA = (Vec<(u32, u32)>, Vec<u32>);
 
-    let results: Vec<ChunkResult> = std::thread::scope(|s| {
+    let pass_a: Vec<PassA> = std::thread::scope(|s| {
         let raw_ref      = &raw[..];
         let term_ids_ref = term_ids;
         let mut handles = Vec::with_capacity(nthreads);
@@ -324,7 +345,8 @@ fn load_corpus(raw: Vec<u8>, term_ids: &FastMap<Vec<u8>, u32>) -> (DocStore, Inv
 
             handles.push(s.spawn(move || {
                 let chunk = &raw_ref[bstart..bend];
-                let mut local_postings: Vec<Vec<u32>> = vec![Vec::new(); n_terms];
+                let mut counts: Vec<u32> = vec![0; n_terms];
+                let mut last: Vec<u32> = vec![u32::MAX; n_terms];
                 let mut spans: Vec<(u32, u32)> = Vec::with_capacity(chunk.len() / 40);
                 let mut tok: Vec<u8> = Vec::with_capacity(64);
                 let mut doc_id: u32 = 0;
@@ -342,63 +364,90 @@ fn load_corpus(raw: Vec<u8>, term_ids: &FastMap<Vec<u8>, u32>) -> (DocStore, Inv
                     };
                     let text = &line[ts..];
 
-                    for &b in text {
-                        let norm = trans_table[b as usize];
-                        if norm != b' ' {
-                            tok.push(norm);
-                        } else if !tok.is_empty() {
-                            record(term_ids_ref, &mut local_postings, &tok, doc_id);
-                            tok.clear();
+                    for_each_token(text, &trans_table, &mut tok, |t| {
+                        if let Some(&tid) = term_ids_ref.get(t) {
+                            let tid = tid as usize;
+                            if last[tid] != doc_id { last[tid] = doc_id; counts[tid] += 1; }
                         }
-                    }
-                    if !tok.is_empty() {
-                        record(term_ids_ref, &mut local_postings, &tok, doc_id);
-                        tok.clear();
-                    }
+                    });
 
                     let st = (bstart + line_off + ts) as u32;
                     spans.push((st, st + text.len() as u32));
                     doc_id += 1;
                 }
-                (spans, local_postings)
+                (spans, counts)
             }));
         }
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
+    let mut span_sets: Vec<Vec<(u32, u32)>> = Vec::with_capacity(nthreads);
+    let mut counts_all: Vec<Vec<u32>> = Vec::with_capacity(nthreads);
+    for (spans, counts) in pass_a {
+        span_sets.push(spans);
+        counts_all.push(counts);
+    }
+
     let mut doc_id_starts: Vec<u32> = Vec::with_capacity(nthreads + 1);
     let mut cumulative: u32 = 0;
     doc_id_starts.push(0);
-    for (spans, _) in &results {
+    for spans in &span_sets {
         cumulative += spans.len() as u32;
         doc_id_starts.push(cumulative);
     }
 
-    let mut term_counts: Vec<u32> = vec![0; n_terms];
-    for (_, pp) in &results {
-        for (tid, p) in pp.iter().enumerate() { term_counts[tid] += p.len() as u32; }
-    }
     let mut inv_offsets: Vec<u32> = Vec::with_capacity(n_terms + 1);
     let mut total: u32 = 0;
     inv_offsets.push(0);
-    for &c in &term_counts { total += c; inv_offsets.push(total); }
-    let mut doc_ids: Vec<u32> = vec![0u32; total as usize];
-    let mut write_pos = inv_offsets[..n_terms].to_vec();
-
-    let mut span_sets: Vec<Vec<(u32, u32)>> = Vec::with_capacity(nthreads);
-
-    for (ci, (spans, pp)) in results.into_iter().enumerate() {
-        let doc_off = doc_id_starts[ci];
-        span_sets.push(spans);
-        for (tid, postings) in pp.into_iter().enumerate() {
-            let len = postings.len();
-            if len > 0 {
-                let wp = write_pos[tid] as usize;
-                for (d, &p) in doc_ids[wp..wp+len].iter_mut().zip(postings.iter()) { *d = p + doc_off; }
-                write_pos[tid] += len as u32;
-            }
-        }
+    for t in 0..n_terms {
+        let mut c: u32 = 0;
+        for counts in &counts_all { c += counts[t]; }
+        total += c;
+        inv_offsets.push(total);
     }
+
+    let mut running: Vec<u32> = inv_offsets[..n_terms].to_vec();
+    let mut cursors: Vec<Vec<u32>> = Vec::with_capacity(nthreads);
+    for counts in &counts_all {
+        cursors.push(running.clone());
+        for t in 0..n_terms { running[t] += counts[t]; }
+    }
+    drop(counts_all);
+
+    let mut doc_ids: Vec<u32> = vec![0u32; total as usize];
+    let out = SharedOut(doc_ids.as_mut_ptr(), doc_ids.len());
+
+    std::thread::scope(|s| {
+        let raw_ref      = &raw[..];
+        let term_ids_ref = term_ids;
+
+        for (i, cursor) in cursors.iter_mut().enumerate() {
+            let spans_i = &span_sets[i];
+            let base    = doc_id_starts[i];
+
+            s.spawn(move || {
+                let mut last: Vec<u32> = vec![u32::MAX; n_terms];
+                let mut tok: Vec<u8> = Vec::with_capacity(64);
+
+                for (local, &(st, en)) in spans_i.iter().enumerate() {
+                    let local = local as u32;
+                    let gid = base + local;
+                    let text = &raw_ref[st as usize..en as usize];
+
+                    for_each_token(text, &trans_table, &mut tok, |t| {
+                        if let Some(&tid) = term_ids_ref.get(t) {
+                            let tid = tid as usize;
+                            if last[tid] != local {
+                                last[tid] = local;
+                                out.write(cursor[tid] as usize, gid);
+                                cursor[tid] += 1;
+                            }
+                        }
+                    });
+                }
+            });
+        }
+    });
 
     (DocStore { raw, spans: span_sets, starts: doc_id_starts, trans: trans_table },
      InvertedIndex { doc_ids, offsets: inv_offsets })
