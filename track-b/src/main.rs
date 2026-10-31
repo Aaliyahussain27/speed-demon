@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufWriter, Read, Write};
 use std::path::Path;
 
 const DOCS_FILE: &str = "docs.txt";
@@ -55,17 +55,21 @@ where
 }
 
 fn extract_queries(path: &Path) -> (Vec<Query>, HashSet<Vec<u8>>) {
-    let file = File::open(path).expect("Failed to open queries.txt");
-    let reader = BufReader::new(file);
+    let mut raw = Vec::new();
+    File::open(path)
+        .expect("Failed to open queries.txt")
+        .read_to_end(&mut raw)
+        .expect("Failed to read queries.txt");
 
     let mut queries = Vec::new();
     let mut needed_terms = HashSet::new();
 
-    for line in reader.split(b'\n') {
-        let mut line = line.expect("Failed to read line");
-        if line.ends_with(b"\r") {
-            line.pop();
-        }
+    for line in raw.split(|&b| b == b'\n') {
+        let line = if line.ends_with(b"\r") {
+            &line[..line.len() - 1]
+        } else {
+            line
+        };
         if line.is_empty() {
             continue;
         }
@@ -136,78 +140,168 @@ fn load_corpus(
     path: &Path,
     needed_terms: &HashSet<Vec<u8>>,
 ) -> (DocArena, HashMap<Vec<u8>, Vec<u32>>) {
-    let file = File::open(path).expect("Failed to open docs.txt");
-    let reader = BufReader::with_capacity(1024 * 1024, file);
+    let mut raw: Vec<u8> = Vec::with_capacity(16 * 1024 * 1024);
+    File::open(path)
+        .expect("Failed to open docs.txt")
+        .read_to_end(&mut raw)
+        .expect("Failed to read docs.txt");
 
     let trans_table = build_trans_table();
 
-    let mut index: HashMap<Vec<u8>, Vec<u32>> = HashMap::with_capacity(needed_terms.len());
-    for term in needed_terms {
-        index.insert(term.clone(), Vec::new());
+    let nthreads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(8);
+
+    // Assign each needed term a stable u32 ID — threads use a flat Vec<Vec<u32>>
+    // indexed by term_id, avoiding per-thread HashMap construction + key cloning.
+    let terms_ordered: Vec<&Vec<u8>> = needed_terms.iter().collect();
+    let n_terms = terms_ordered.len();
+    // term_ids: &[u8] → u32 (content-based lookup via Borrow<[u8]>)
+    let term_ids: HashMap<&[u8], u32> = terms_ordered
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (t.as_slice(), i as u32))
+        .collect();
+
+    // Find chunk boundaries at line starts so no line is split across threads
+    let mut byte_starts: Vec<usize> = vec![0];
+    for i in 1..nthreads {
+        let mut pos = (i * raw.len()) / nthreads;
+        while pos < raw.len() && raw[pos] != b'\n' {
+            pos += 1;
+        }
+        if pos < raw.len() {
+            pos += 1; // skip the newline itself
+        }
+        byte_starts.push(pos);
+    }
+    byte_starts.push(raw.len());
+
+    // Pre-count non-empty docs per chunk so each thread knows its doc_id range
+    let mut doc_id_starts: Vec<u32> = vec![0];
+    let mut cumulative: u32 = 0;
+    for i in 0..nthreads {
+        let chunk = &raw[byte_starts[i]..byte_starts[i + 1]];
+        let count = chunk
+            .split(|&b| b == b'\n')
+            .filter(|line| {
+                let line = if line.ends_with(b"\r") { &line[..line.len() - 1] } else { line };
+                !line.is_empty()
+            })
+            .count() as u32;
+        cumulative += count;
+        doc_id_starts.push(cumulative);
     }
 
-    let mut arena_data = Vec::with_capacity(32 * 1024 * 1024);
-    let mut arena_offsets = Vec::with_capacity(250_000);
+    // Each thread returns: (arena_data, arena_offsets, Vec<Vec<u32>> by term_id)
+    type ChunkResult = (Vec<u8>, Vec<(u32, u32)>, Vec<Vec<u32>>);
 
-    let mut clean = Vec::new();
-    let mut doc_id: u32 = 0;
+    let results: Vec<ChunkResult> = std::thread::scope(|s| {
+        // Reborrow as shared references (&T is Copy) so each move|| closure
+        // copies the fat pointer rather than trying to move the owned value.
+        let raw_ref      = &raw[..];       // &[u8]                — Copy
+        let term_ids_ref = &term_ids;      // &HashMap<&[u8], u32> — Copy
+        let mut handles = Vec::with_capacity(nthreads);
+        for i in 0..nthreads {
+            // Pass byte indices (usize — Copy) and doc_id_start (u32 — Copy)
+            let start        = byte_starts[i];
+            let end          = byte_starts[i + 1];
+            let doc_id_start = doc_id_starts[i];
+            handles.push(s.spawn(move || {
+                let chunk = &raw_ref[start..end];
+                // Flat Vec indexed by term_id — zero string allocation in hot path
+                let mut local_postings: Vec<Vec<u32>> = vec![Vec::new(); n_terms];
+                let mut arena_data: Vec<u8>       = Vec::new();
+                let mut arena_offsets: Vec<(u32, u32)> = Vec::new();
+                let mut clean: Vec<u8>            = Vec::new();
+                let mut doc_id = doc_id_start;
 
-    for line in reader.split(b'\n') {
-        let mut line = line.expect("Failed to read line");
-        if line.ends_with(b"\r") {
-            line.pop();
-        }
-        if line.is_empty() && doc_id > 0 {
-            // Trailing empty lines
-            continue;
-        }
+                for line in chunk.split(|&b| b == b'\n') {
+                    let line = if line.ends_with(b"\r") {
+                        &line[..line.len() - 1]
+                    } else {
+                        line
+                    };
+                    if line.is_empty() { continue; }
 
-        let tab_pos = line.iter().position(|&b| b == b'\t');
-        let text = if let Some(t) = tab_pos {
-            &line[t + 1..]
-        } else {
-            b""
-        };
+                    let text = match line.iter().position(|&b| b == b'\t') {
+                        Some(t) => &line[t + 1..],
+                        None    => b"",
+                    };
 
-        clean.clear();
-        clean.push(b' ');
-        for &b in text {
-            clean.push(trans_table[b as usize]);
-        }
-        clean.push(b' ');
+                    clean.clear();
+                    clean.push(b' ');
+                    for &b in text {
+                        clean.push(trans_table[b as usize]);
+                    }
+                    clean.push(b' ');
 
-        let start_offset = arena_data.len() as u32;
-        arena_data.push(b' ');
+                    let start_offset = arena_data.len() as u32;
+                    arena_data.push(b' ');
 
-        let mut first = true;
-        for_each_token(&clean, |tok| {
-            if let Some(postings) = index.get_mut(tok) {
-                if postings.last().copied() != Some(doc_id) {
-                    postings.push(doc_id);
+                    for_each_token(&clean, |tok| {
+                        // One lookup into the shared read-only term_ids map
+                        if let Some(&tid) = term_ids_ref.get(tok) {
+                            let postings = &mut local_postings[tid as usize];
+                            if postings.last().copied() != Some(doc_id) {
+                                postings.push(doc_id);
+                            }
+                        }
+                        arena_data.extend_from_slice(tok);
+                        arena_data.push(b' ');
+                    });
+
+                    let end_offset = arena_data.len() as u32;
+                    arena_offsets.push((start_offset, end_offset));
+                    doc_id += 1;
                 }
-            }
-            if !first {
-                arena_data.push(b' ');
-            }
-            arena_data.extend_from_slice(tok);
-            first = false;
-        });
 
-        arena_data.push(b' ');
-        let end_offset = arena_data.len() as u32;
-        arena_offsets.push((start_offset, end_offset));
+                (arena_data, arena_offsets, local_postings)
+            }));
+        }
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
 
-        doc_id += 1;
+    // --- Merge phase ---
+    // Concat arenas (adjust offsets); concat posting lists per term_id
+    // (already sorted ascending since threads own disjoint doc_id ranges).
+    let mut merged_data: Vec<u8>           = Vec::with_capacity(32 * 1024 * 1024);
+    let mut merged_offsets: Vec<(u32, u32)> = Vec::with_capacity(250_000);
+    let mut final_postings: Vec<Vec<u32>>  = vec![Vec::new(); n_terms];
+
+    for (partial_data, partial_offsets, partial_postings) in results {
+        let base = merged_data.len() as u32;
+        merged_data.extend_from_slice(&partial_data);
+        for (s, e) in partial_offsets {
+            merged_offsets.push((s + base, e + base));
+        }
+        for (tid, postings) in partial_postings.into_iter().enumerate() {
+            if !postings.is_empty() {
+                final_postings[tid].extend_from_slice(&postings);
+            }
+        }
+    }
+
+    // Convert flat Vec back to the HashMap the rest of the code expects
+    let mut final_index: HashMap<Vec<u8>, Vec<u32>> = HashMap::with_capacity(n_terms);
+    for (tid, term) in terms_ordered.iter().enumerate() {
+        final_index.insert(
+            (*term).clone(),
+            std::mem::take(&mut final_postings[tid]),
+        );
     }
 
     (
         DocArena {
-            data: arena_data,
-            offsets: arena_offsets,
+            data: merged_data,
+            offsets: merged_offsets,
         },
-        index,
+        final_index,
     )
 }
+
+
 
 fn intersect(a: &[u32], b: &[u32], out: &mut Vec<u32>) {
     out.clear();
