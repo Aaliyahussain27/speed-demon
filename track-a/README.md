@@ -26,13 +26,16 @@ Stage 2. The program reads the log once, through a 1 MB buffer, so the whole fil
 
 Stage 3: the endpoint lookup uses an FNV-1a hash instead of the standard `HashMap` hash, which is slower on short strings. The build uses `lto = "fat"`, `codegen-units = 1` and `panic = "abort"` in `Cargo.toml`, plus `target-cpu=native` in `.cargo/config.toml`. None of these change the output.
 
-Stage 4 reads the log in chunks, turns each line into a small record, and groups the records by box with a counting sort. The program never holds the whole file as text.
+Stage 4: reads the log in chunks, turns each line into a small record, and groups the records by box with a counting sort. The program never holds the whole file as text.
 
+Stage 5:
+Parallel blocks. The input is read in 4 MB blocks. Each block is cut after a line break, then split across threads at line breaks. Each thread fills its own table.
+Merge. The per-thread tables are merged into one table, then each box gets its percentiles from a sorted list (nearest rank).
+Output. Endpoints are sorted by name bytes, then hours are in time order.
 ## Dependencies
 
 None.
 
 ## With another 24 hours
 
-- Profile-guided optimization (PGO), trained on generator output, as a separate measured stage.
-- Split the input into chunks and process them on several threads, then merge the results by endpoint name.
+Profile-guided optimization (PGO), as its own stage.
