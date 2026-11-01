@@ -58,8 +58,6 @@ struct Worker {
     unmatched: usize,
     aggs: Vec<Agg>,
     name_ids: HashMap<Box<[u8]>, u32>,
-    /// Local id -> name bytes.
-    names: Vec<Box<[u8]>>,
     /// Holds one unescaped name at a time.
     scratch: Vec<u8>,
 }
@@ -70,7 +68,6 @@ impl Worker {
             unmatched: nslots - 1,
             aggs: vec![Agg::new(); nslots],
             name_ids: HashMap::new(),
-            names: Vec::new(),
             scratch: Vec::new(),
         }
     }
@@ -109,14 +106,12 @@ fn set_bit(bits: &mut Vec<u64>, id: u32) {
 }
 
 /// Give a name its local id, the first time it is seen.
-fn intern(ids: &mut HashMap<Box<[u8]>, u32>, names: &mut Vec<Box<[u8]>>, name: &[u8]) -> u32 {
+fn intern(ids: &mut HashMap<Box<[u8]>, u32>, name: &[u8]) -> u32 {
     if let Some(&id) = ids.get(name) {
         return id;
     }
-    let id = names.len() as u32;
-    let boxed: Box<[u8]> = name.into();
-    names.push(boxed.clone());
-    ids.insert(boxed, id);
+    let id = ids.len() as u32;
+    ids.insert(name.into(), id);
     id
 }
 
@@ -195,7 +190,7 @@ fn parse_record(d: &[u8], mut p: usize, region_map: &[u16], w: &mut Worker) -> u
         unescape_into(&d[ns..ne], &mut w.scratch);
         &w.scratch
     };
-    let lid = intern(&mut w.name_ids, &mut w.names, name);
+    let lid = intern(&mut w.name_ids, name);
     let name_len = name.len() as u64;
 
     // Join: region -> country slot.
@@ -344,23 +339,20 @@ fn main() -> std::io::Result<()> {
 
     // Merge the threads' results.
     let mut global_ids: HashMap<Box<[u8]>, u32> = HashMap::new();
+    let mut next_global_id = 0u32;
     let mut totals: Vec<Agg> = vec![Agg::new(); nslots];
     let mut distinct_bits: Vec<Vec<u64>> = vec![Vec::new(); nslots];
-    for w in &workers {
+    for w in workers.into_iter() {
         // Local name id -> global name id.
-        let map: Vec<u32> = w
-            .names
-            .iter()
-            .map(|name| {
-                if let Some(&g) = global_ids.get(&name[..]) {
-                    g
-                } else {
-                    let g = global_ids.len() as u32;
-                    global_ids.insert(name.clone(), g);
-                    g
-                }
-            })
-            .collect();
+        let mut map = vec![0u32; w.name_ids.len()];
+        for (name, local_id) in w.name_ids.into_iter() {
+            let global_id = *global_ids.entry(name).or_insert_with(|| {
+                let g = next_global_id;
+                next_global_id += 1;
+                g
+            });
+            map[local_id as usize] = global_id;
+        }
 
         for (slot, a) in w.aggs.iter().enumerate() {
             if a.count == 0 {
