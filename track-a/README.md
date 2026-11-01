@@ -24,12 +24,13 @@ Stage 2. The program reads the log once, through a 1 MB buffer, so the whole fil
 7. Error rate is `errors * 1000000 / count`, in integers.
 8. Output goes hour by hour, then endpoint by its name's bytes, so the order matches the spec.
 
+Stage 3: the endpoint lookup uses an FNV-1a hash instead of the standard `HashMap` hash, which is slower on short strings. The build uses `lto = "fat"`, `codegen-units = 1` and `panic = "abort"` in `Cargo.toml`, plus `target-cpu=native` in `.cargo/config.toml`. None of these change the output.
+
 ## Dependencies
 
 None.
 
 ## With another 24 hours
 
-- Replace the `HashMap` endpoint lookup with a faster hash or a precomputed table.
-- Measure each change on its own, with a board run ID for each row in PERF.md.
-- Reduce source lines where the code repeats itself, since source size counts toward the score.
+- Replace the per-box `Vec` with one flat list of records, counted and placed in one array.
+- Split the input across threads, each with its own table, and merge the tables by endpoint name.
