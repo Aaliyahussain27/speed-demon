@@ -99,8 +99,8 @@ struct Agg {
     amt_max: i64,
     name_bytes: u64,
     note_bytes: u64,
-    /// Bit i is set when this thread saw local name id i in this group.
-    name_bits: Vec<u64>,
+    /// Sparse local name IDs seen in this group by this thread.
+    name_ids: Vec<u32>,
 }
 
 impl Agg {
@@ -113,7 +113,7 @@ impl Agg {
             amt_max: i64::MIN,
             name_bytes: 0,
             note_bytes: 0,
-            name_bits: Vec::new(),
+            name_ids: Vec::new(),
         }
     }
 }
@@ -416,7 +416,7 @@ fn parse_record(d: &[u8], mut p: usize, region_map: &[u16], w: &mut Worker) -> u
     agg.name_bytes += name_len;
     // Note bytes: raw length minus one per "" pair (an embedded LF counts as 1, as the spec says).
     agg.note_bytes += ((ce - cs) - cpairs) as u64;
-    set_bit(&mut agg.name_bits, lid);
+    agg.name_ids.push(lid);
     p
 }
 
@@ -454,6 +454,12 @@ fn run_chunk(
     if let Some(mut p) = first {
         while p < end && p < data.len() {
             p = parse_record(data, p, region_map, &mut w);
+        }
+    }
+    for a in &mut w.aggs {
+        if !a.name_ids.is_empty() {
+            a.name_ids.sort_unstable();
+            a.name_ids.dedup();
         }
     }
     w
@@ -586,13 +592,8 @@ fn main() -> std::io::Result<()> {
                 t.amt_max = t.amt_max.max(a.amt_max);
                 t.name_bytes += a.name_bytes;
                 t.note_bytes += a.note_bytes;
-                for (word_idx, &word) in a.name_bits.iter().enumerate() {
-                    let mut bits = word;
-                    while bits != 0 {
-                        let bit = bits.trailing_zeros() as usize;
-                        bits &= bits - 1;
-                        set_bit(&mut distinct_bits[slot], map[word_idx * 64 + bit]);
-                    }
+                for &local_id in &a.name_ids {
+                    set_bit(&mut distinct_bits[slot], map[local_id as usize]);
                 }
             }
         }
