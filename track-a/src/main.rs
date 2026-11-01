@@ -1,11 +1,6 @@
 //! Track A (Ingest): summarize request log lines per (hour, endpoint).
 //!
-//! Stage 2 version. Changes from stage 1:
-//!   - the input is read through a 1 MB buffer, not loaded into one String
-//!   - timestamp, status and latency are read from bytes, not parsed as text
-//!   - the hour is a number (slot 0..95), not a String
-//!   - each endpoint gets a number the first time it is seen, so boxes live in a flat Vec
-//!   - latencies are stored as u32 (the spec says they fit)
+//! Stage 2 version with a faster endpoint hash.
 //!
 //! Usage:
 //!   solution                      read /data/requests.log, write /out/summary.txt
@@ -15,6 +10,7 @@
 use std::collections::HashMap;
 use std::env;
 use std::fs::{self, File};
+use std::hash::{BuildHasherDefault, Hasher};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::Path;
 
@@ -22,6 +18,28 @@ use std::path::Path;
 const HOURS: usize = 96;
 /// Date text for each day ordinal (0 = 2026-10-30).
 const DAYS: [&str; 4] = ["2026-10-30", "2026-10-31", "2026-11-01", "2026-11-02"];
+
+/// FNV-1a: a small, fast hash function. No crates needed.
+#[derive(Default)]
+struct Fnv(u64);
+
+impl Hasher for Fnv {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        let mut h = if self.0 == 0 { 0xcbf2_9ce4_8422_2325 } else { self.0 };
+        for &b in bytes {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+        self.0 = h;
+    }
+}
+
+/// A HashMap that uses the FNV hash instead of the slow default one.
+type FastMap = HashMap<Box<[u8]>, u32, BuildHasherDefault<Fnv>>;
 
 /// Everything we keep for one (endpoint, hour) box.
 #[derive(Default)]
@@ -34,7 +52,7 @@ struct Group {
 
 struct State {
     /// Endpoint bytes -> endpoint id.
-    ids: HashMap<Box<[u8]>, u32>,
+    ids: FastMap,
     /// Endpoint id -> endpoint bytes.
     names: Vec<Box<[u8]>>,
     /// Flat table. Index = endpoint_id * HOURS + hour_slot.
@@ -44,7 +62,7 @@ struct State {
 impl State {
     fn new() -> Self {
         State {
-            ids: HashMap::new(),
+            ids: FastMap::default(),
             names: Vec::new(),
             groups: Vec::new(),
         }
