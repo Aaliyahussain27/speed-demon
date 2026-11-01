@@ -1,16 +1,12 @@
-//! Track A (Ingest): summarize request log lines per (hour, endpoint).
+//! Track A (Ingest), flat-array version.
 //!
-//! Stage 2 version with a faster endpoint hash.
-//!
-//! Usage:
-//!   solution                      read /data/requests.log, write /out/summary.txt
-//!   solution <input> <output>     read a file, write a file
-//!   solution - <output>           read the log from stdin (for streaming)
+//! Pass 1: read every line into a small record (box key, latency) and count errors.
+//! Pass 2: counting sort, so each box's latencies sit next to each other in one array.
+//! Then sort each box's slice and read the percentiles.
 
 use std::collections::HashMap;
 use std::env;
 use std::fs::{self, File};
-use std::hash::{BuildHasherDefault, Hasher};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::Path;
 
@@ -19,70 +15,42 @@ const HOURS: usize = 96;
 /// Date text for each day ordinal (0 = 2026-10-30).
 const DAYS: [&str; 4] = ["2026-10-30", "2026-10-31", "2026-11-01", "2026-11-02"];
 
-/// FNV-1a: a small, fast hash function. No crates needed.
-#[derive(Default)]
-struct Fnv(u64);
-
-impl Hasher for Fnv {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-
-    fn write(&mut self, bytes: &[u8]) {
-        let mut h = if self.0 == 0 { 0xcbf2_9ce4_8422_2325 } else { self.0 };
-        for &b in bytes {
-            h ^= b as u64;
-            h = h.wrapping_mul(0x0100_0000_01b3);
-        }
-        self.0 = h;
-    }
+/// One request, reduced to what we need: its box key and its latency.
+/// key = endpoint_id * HOURS + hour_slot.
+#[derive(Clone, Copy)]
+struct Rec {
+    key: u32,
+    latency: u32,
 }
 
-/// A HashMap that uses the FNV hash instead of the slow default one.
-type FastMap = HashMap<Box<[u8]>, u32, BuildHasherDefault<Fnv>>;
-
-/// Everything we keep for one (endpoint, hour) box.
-#[derive(Default)]
-struct Group {
-    /// Responses with status 500 to 599.
-    errors: u32,
-    /// Every latency in this box, in microseconds. Duplicates are kept.
-    latencies: Vec<u32>,
-}
-
-struct State {
+/// Everything we collect while reading the input.
+struct Parsed {
     /// Endpoint bytes -> endpoint id.
-    ids: FastMap,
+    ids: HashMap<Box<[u8]>, u32>,
     /// Endpoint id -> endpoint bytes.
     names: Vec<Box<[u8]>>,
-    /// Flat table. Index = endpoint_id * HOURS + hour_slot.
-    groups: Vec<Group>,
+    /// One record per request, in input order.
+    recs: Vec<Rec>,
+    /// Error count per box. Index = key.
+    errors: Vec<u32>,
 }
 
-impl State {
-    fn new() -> Self {
-        State {
-            ids: FastMap::default(),
-            names: Vec::new(),
-            groups: Vec::new(),
-        }
-    }
-
+impl Parsed {
     /// Return the id for this endpoint, giving it a new id the first time it appears.
-    fn endpoint_id(&mut self, endpoint: &[u8]) -> usize {
+    fn endpoint_id(&mut self, endpoint: &[u8]) -> u32 {
         if let Some(&id) = self.ids.get(endpoint) {
-            return id as usize;
+            return id;
         }
         let id = self.names.len() as u32;
         self.names.push(endpoint.into());
         self.ids.insert(endpoint.into(), id);
-        // Make room for one box per hour slot for this new endpoint.
-        self.groups.resize_with(self.groups.len() + HOURS, Group::default);
-        id as usize
+        // Room for one box per hour slot for this new endpoint.
+        self.errors.resize(self.errors.len() + HOURS, 0);
+        id
     }
 }
 
-/// Turn ASCII digits into a number, reading byte by byte. No text parsing.
+/// Turn ASCII digits into a number, reading byte by byte.
 fn digits(bytes: &[u8]) -> u32 {
     bytes
         .iter()
@@ -90,7 +58,7 @@ fn digits(bytes: &[u8]) -> u32 {
 }
 
 /// Turn a timestamp like "2026-10-30T18:07:18.569411Z" into an hour slot.
-/// The slot is day ordinal * 24 + hour. Minutes and seconds are ignored, which rounds down.
+/// Slot = day ordinal * 24 + hour. Minutes and seconds are ignored, which rounds down.
 fn hour_slot(ts: &[u8]) -> usize {
     // Positions: 0-3 year, 5-6 month, 8-9 day, 11-12 hour.
     let month = digits(&ts[5..7]);
@@ -101,16 +69,15 @@ fn hour_slot(ts: &[u8]) -> usize {
     ordinal as usize * 24 + hour as usize
 }
 
-/// Nearest-rank percentile of a sorted list (rank = ceil(p * n / 100)).
+/// Nearest-rank percentile of a sorted slice (rank = ceil(p * n / 100)).
 fn percentile(sorted: &[u32], p: u64) -> u32 {
     let n = sorted.len() as u64;
     let rank = (p * n + 99) / 100;
     sorted[(rank - 1) as usize]
 }
 
-/// Handle one line (without its newline). Line format: timestamp method endpoint status latency_us.
-fn process_line(line: &[u8], st: &mut State) {
-    // splitn works on byte slices, so it does not allocate new strings.
+/// Handle one line (without its newline). Format: timestamp method endpoint status latency_us.
+fn process_line(line: &[u8], p: &mut Parsed) {
     let mut fields = line.splitn(5, |&b| b == b' ');
     let ts = fields.next().unwrap();
     let _method = fields.next().unwrap(); // not needed for Track A
@@ -118,49 +85,76 @@ fn process_line(line: &[u8], st: &mut State) {
     let status = digits(fields.next().unwrap());
     let latency = digits(fields.next().unwrap());
 
-    let slot = hour_slot(ts);
-    let eid = st.endpoint_id(endpoint);
-
-    let group = &mut st.groups[eid * HOURS + slot];
-    group.latencies.push(latency);
+    let key = p.endpoint_id(endpoint) * HOURS as u32 + hour_slot(ts) as u32;
     if (500..=599).contains(&status) {
-        group.errors += 1;
+        p.errors[key as usize] += 1;
     }
+    p.recs.push(Rec { key, latency });
+}
+
+/// Counting sort: put every latency into one array, grouped by box.
+/// Returns (offsets, values). Box k's latencies are values[offsets[k]..offsets[k + 1]].
+fn group_by_box(p: &Parsed) -> (Vec<u32>, Vec<u32>) {
+    let n_keys = p.errors.len();
+
+    // Count how many requests each box has. Shift by one so the prefix sum gives start positions.
+    let mut offsets = vec![0u32; n_keys + 1];
+    for r in &p.recs {
+        offsets[r.key as usize + 1] += 1;
+    }
+    for k in 0..n_keys {
+        offsets[k + 1] += offsets[k];
+    }
+
+    // Place each latency at the next free slot of its box.
+    let mut next = offsets.clone();
+    let mut values = vec![0u32; p.recs.len()];
+    for r in &p.recs {
+        let k = r.key as usize;
+        values[next[k] as usize] = r.latency;
+        next[k] += 1;
+    }
+    (offsets, values)
 }
 
 /// Build the output text: one line per non-empty box, hour first, then endpoint bytes.
-fn render(st: &mut State) -> Vec<u8> {
+fn render(p: &Parsed, offsets: &[u32], values: &mut [u32]) -> Vec<u8> {
     // Endpoint ids in the byte order of their names.
-    let mut order: Vec<usize> = (0..st.names.len()).collect();
-    order.sort_by(|&a, &b| st.names[a].cmp(&st.names[b]));
+    let mut order: Vec<usize> = (0..p.names.len()).collect();
+    order.sort_by(|&a, &b| p.names[a].cmp(&p.names[b]));
 
     let mut out = Vec::new();
     for slot in 0..HOURS {
         for &eid in &order {
-            let group = &mut st.groups[eid * HOURS + slot];
-            if group.latencies.is_empty() {
-                continue;
+            let key = eid * HOURS + slot;
+            let start = offsets[key] as usize;
+            let end = offsets[key + 1] as usize;
+            if start == end {
+                continue; // empty box, no line
             }
-            group.latencies.sort_unstable();
 
-            let count = group.latencies.len() as u64;
-            let p50 = percentile(&group.latencies, 50);
-            let p95 = percentile(&group.latencies, 95);
-            let p99 = percentile(&group.latencies, 99);
+            values[start..end].sort_unstable();
+            let lat: &[u32] = &values[start..end];
+
+            let count = lat.len() as u64;
+            let p50 = percentile(lat, 50);
+            let p95 = percentile(lat, 95);
+            let p99 = percentile(lat, 99);
+            let errors = p.errors[key] as u64;
             // Error rate in parts per million, rounded down.
-            let error_ppm = group.errors as u64 * 1_000_000 / count;
+            let error_ppm = errors * 1_000_000 / count;
 
             writeln!(
                 out,
                 "{}T{:02}:00:00Z {} {} {} {} {} {} {}",
                 DAYS[slot / 24],
                 slot % 24,
-                String::from_utf8_lossy(&st.names[eid]),
+                String::from_utf8_lossy(&p.names[eid]),
                 count,
                 p50,
                 p95,
                 p99,
-                group.errors,
+                errors,
                 error_ppm
             )
             .unwrap();
@@ -185,7 +179,12 @@ fn main() -> io::Result<()> {
     let output = args.get(2).map(String::as_str).unwrap_or("/out/summary.txt");
 
     let mut reader = open_input(input)?;
-    let mut st = State::new();
+    let mut p = Parsed {
+        ids: HashMap::new(),
+        names: Vec::new(),
+        recs: Vec::with_capacity(3_200_000),
+        errors: Vec::new(),
+    };
     let mut line = Vec::with_capacity(256);
 
     loop {
@@ -201,11 +200,15 @@ fn main() -> io::Result<()> {
             line.pop();
         }
         if !line.is_empty() {
-            process_line(&line, &mut st);
+            process_line(&line, &mut p);
         }
     }
 
-    let out = render(&mut st);
+    let (offsets, mut values) = group_by_box(&p);
+    // The records are no longer needed, so give their memory back.
+    p.recs = Vec::new();
+
+    let out = render(&p, &offsets, &mut values);
     if let Some(dir) = Path::new(output).parent() {
         fs::create_dir_all(dir)?;
     }
