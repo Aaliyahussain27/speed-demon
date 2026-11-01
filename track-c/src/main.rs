@@ -15,9 +15,65 @@
 use std::collections::HashMap;
 use std::env;
 use std::fs;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::io::Write;
 use std::path::Path;
 use std::thread;
+
+const K: u64 = 0x517cc1b727220a95;
+
+#[derive(Default)]
+struct FxHasher {
+    hash: u64,
+}
+
+impl Hasher for FxHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.hash
+    }
+
+    #[inline]
+    fn write(&mut self, mut bytes: &[u8]) {
+        while bytes.len() >= 8 {
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(&bytes[..8]);
+            self.write_u64(u64::from_ne_bytes(buf));
+            bytes = &bytes[8..];
+        }
+        if bytes.len() >= 4 {
+            let mut buf = [0u8; 4];
+            buf.copy_from_slice(&bytes[..4]);
+            self.write_u32(u32::from_ne_bytes(buf));
+            bytes = &bytes[4..];
+        }
+        for &b in bytes {
+            self.write_u8(b);
+        }
+    }
+
+    #[inline]
+    fn write_u8(&mut self, i: u8) {
+        self.hash = (self.hash.rotate_left(5) ^ (i as u64)).wrapping_mul(K);
+    }
+
+    #[inline]
+    fn write_u32(&mut self, i: u32) {
+        self.hash = (self.hash.rotate_left(5) ^ (i as u64)).wrapping_mul(K);
+    }
+
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        self.hash = (self.hash.rotate_left(5) ^ i).wrapping_mul(K);
+    }
+
+    #[inline]
+    fn write_usize(&mut self, i: usize) {
+        self.hash = (self.hash.rotate_left(5) ^ (i as u64)).wrapping_mul(K);
+    }
+}
+
+type FastMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
 
 const MAX_REGION: usize = 10_000_000;
 /// Marks a region id that is not in the lookup file.
@@ -57,7 +113,7 @@ struct Worker {
     /// Slot index of _UNMATCHED (the last slot).
     unmatched: usize,
     aggs: Vec<Agg>,
-    name_ids: HashMap<Box<[u8]>, u32>,
+    name_ids: FastMap<Box<[u8]>, u32>,
     /// Holds one unescaped name at a time.
     scratch: Vec<u8>,
 }
@@ -67,7 +123,7 @@ impl Worker {
         Worker {
             unmatched: nslots - 1,
             aggs: vec![Agg::new(); nslots],
-            name_ids: HashMap::new(),
+            name_ids: FastMap::default(),
             scratch: Vec::new(),
         }
     }
@@ -106,7 +162,7 @@ fn set_bit(bits: &mut Vec<u64>, id: u32) {
 }
 
 /// Give a name its local id, the first time it is seen.
-fn intern(ids: &mut HashMap<Box<[u8]>, u32>, name: &[u8]) -> u32 {
+fn intern(ids: &mut FastMap<Box<[u8]>, u32>, name: &[u8]) -> u32 {
     if let Some(&id) = ids.get(name) {
         return id;
     }
@@ -338,7 +394,7 @@ fn main() -> std::io::Result<()> {
     });
 
     // Merge the threads' results.
-    let mut global_ids: HashMap<Box<[u8]>, u32> = HashMap::new();
+    let mut global_ids: FastMap<Box<[u8]>, u32> = FastMap::default();
     let mut next_global_id = 0u32;
     let mut totals: Vec<Agg> = vec![Agg::new(); nslots];
     let mut distinct_bits: Vec<Vec<u64>> = vec![Vec::new(); nslots];
