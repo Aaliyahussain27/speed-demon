@@ -32,10 +32,14 @@ Stage 5:
 Parallel blocks. The input is read in 4 MB blocks. Each block is cut after a line break, then split across threads at line breaks. Each thread fills its own table.
 Merge. The per-thread tables are merged into one table, then each box gets its percentiles from a sorted list (nearest rank).
 Output. Endpoints are sorted by name bytes, then hours are in time order.
+
+Stage 6: the Docker build trains the program on the public generator’s sample log, merges the profile, and rebuilds with it, using the allowlisted halloumee/speed-demon-rust image.
+
 ## Dependencies
 
 None.
 
 ## With another 24 hours
 
-Profile-guided optimization (PGO), as its own stage.
+Try PGO on the best version, using the organizers' Rust image and training data from the public generator. Keep it only if the board result improves.
+Before the final push, check the full dataset hash against the expected hash, then push one final board run and fill in PERF.md.

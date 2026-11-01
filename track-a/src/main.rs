@@ -1,64 +1,66 @@
-//! Track A (Ingest): parallel version of the stage 4 flat-table code.
+//! Track A (Ingest), flat-array version.
 //!
-//! How it works:
-//! 1. Read the input in 16 MB blocks. Cut each block after its last line break,
-//!    so every block holds whole lines only.
-//! 2. Split each block into one part per thread, cut at line breaks.
-//! 3. Each thread fills its own table (endpoint ids and boxes).
-//! 4. Merge the per-thread tables into one table, then compute the percentiles.
-//!
-//! Output line: `hour endpoint count p50 p95 p99 errors error_ppm`
+//! Pass 1: read every line into a small record (box key, latency) and count errors.
+//! Pass 2: counting sort, so each box's latencies sit next to each other in one array.
+//! Then sort each box's slice and read the percentiles.
 
 use std::collections::HashMap;
 use std::env;
 use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::Path;
-use std::thread;
 
-/// Hour slots: 4 calendar days x 24 hours.
+/// Hour slots: 4 calendar days x 24 hours. The data uses 72 of the 96.
 const HOURS: usize = 96;
 /// Date text for each day ordinal (0 = 2026-10-30).
 const DAYS: [&str; 4] = ["2026-10-30", "2026-10-31", "2026-11-01", "2026-11-02"];
-/// Bytes read per block (4 MB: small enough to keep memory low).
-const BLOCK: usize = 4 << 20;
 
-#[derive(Default)]
-struct Group {
-    errors: u32,
-    latencies: Vec<u32>,
+/// One request, reduced to what we need: its box key and its latency.
+/// key = endpoint_id * HOURS + hour_slot.
+#[derive(Clone, Copy)]
+struct Rec {
+    key: u32,
+    latency: u32,
 }
 
-#[derive(Default)]
-struct State {
+/// Everything we collect while reading the input.
+struct Parsed {
     /// Endpoint bytes -> endpoint id.
     ids: HashMap<Box<[u8]>, u32>,
     /// Endpoint id -> endpoint bytes.
     names: Vec<Box<[u8]>>,
-    /// Flat table. Index = endpoint_id * HOURS + hour_slot.
-    groups: Vec<Group>,
+    /// One record per request, in input order.
+    recs: Vec<Rec>,
+    /// Error count per box. Index = key.
+    errors: Vec<u32>,
 }
 
-impl State {
-    fn endpoint_id(&mut self, endpoint: &[u8]) -> usize {
+impl Parsed {
+    /// Return the id for this endpoint, giving it a new id the first time it appears.
+    fn endpoint_id(&mut self, endpoint: &[u8]) -> u32 {
         if let Some(&id) = self.ids.get(endpoint) {
-            return id as usize;
+            return id;
         }
         let id = self.names.len() as u32;
         self.names.push(endpoint.into());
         self.ids.insert(endpoint.into(), id);
-        self.groups.resize_with(self.groups.len() + HOURS, Group::default);
-        id as usize
+        // Room for one box per hour slot for this new endpoint.
+        self.errors.resize(self.errors.len() + HOURS, 0);
+        id
     }
 }
 
+/// Turn ASCII digits into a number, reading byte by byte.
 fn digits(bytes: &[u8]) -> u32 {
     bytes
         .iter()
         .fold(0u64, |acc, &c| acc * 10 + (c - b'0') as u64) as u32
 }
 
+/// Turn a timestamp like "2026-10-30T18:07:18.569411Z" into an hour slot.
+/// Slot = day ordinal * 24 + hour. Minutes and seconds are ignored, which rounds down.
 fn hour_slot(ts: &[u8]) -> usize {
+    // Positions: 0-3 year, 5-6 month, 8-9 day, 11-12 hour.
     let month = digits(&ts[5..7]);
     let day = digits(&ts[8..10]);
     let hour = digits(&ts[11..13]);
@@ -67,156 +69,92 @@ fn hour_slot(ts: &[u8]) -> usize {
     ordinal as usize * 24 + hour as usize
 }
 
-/// Nearest-rank percentile of a sorted list (rank = ceil(p * n / 100)).
+/// Nearest-rank percentile of a sorted slice (rank = ceil(p * n / 100)).
 fn percentile(sorted: &[u32], p: u64) -> u32 {
     let n = sorted.len() as u64;
     let rank = (p * n + 99) / 100;
     sorted[(rank - 1) as usize]
 }
 
-/// One line without its line break. Format: timestamp method endpoint status latency_us.
-fn process_line(line: &[u8], st: &mut State) {
+/// Handle one line (without its newline). Format: timestamp method endpoint status latency_us.
+fn process_line(line: &[u8], p: &mut Parsed) {
     let mut fields = line.splitn(5, |&b| b == b' ');
     let ts = fields.next().unwrap();
-    let _method = fields.next().unwrap();
+    let _method = fields.next().unwrap(); // not needed for Track A
     let endpoint = fields.next().unwrap();
     let status = digits(fields.next().unwrap());
     let latency = digits(fields.next().unwrap());
 
-    let slot = hour_slot(ts);
-    let eid = st.endpoint_id(endpoint);
-
-    let group = &mut st.groups[eid * HOURS + slot];
-    group.latencies.push(latency);
+    let key = p.endpoint_id(endpoint) * HOURS as u32 + hour_slot(ts) as u32;
     if (500..=599).contains(&status) {
-        group.errors += 1;
+        p.errors[key as usize] += 1;
     }
+    p.recs.push(Rec { key, latency });
 }
 
-/// Add one thread's table into the global table.
-fn absorb(global: &mut State, mut local: State) {
-    for (lid, name) in local.names.iter().enumerate() {
-        let gid = global.endpoint_id(name);
-        for slot in 0..HOURS {
-            let src = &mut local.groups[lid * HOURS + slot];
-            if src.latencies.is_empty() {
-                continue;
-            }
-            let dst = &mut global.groups[gid * HOURS + slot];
-            dst.errors += src.errors;
-            dst.latencies.append(&mut src.latencies);
-        }
+/// Counting sort: put every latency into one array, grouped by box.
+/// Returns (offsets, values). Box k's latencies are values[offsets[k]..offsets[k + 1]].
+fn group_by_box(p: &Parsed) -> (Vec<u32>, Vec<u32>) {
+    let n_keys = p.errors.len();
+
+    // Count how many requests each box has. Shift by one so the prefix sum gives start positions.
+    let mut offsets = vec![0u32; n_keys + 1];
+    for r in &p.recs {
+        offsets[r.key as usize + 1] += 1;
     }
+    for k in 0..n_keys {
+        offsets[k + 1] += offsets[k];
+    }
+
+    // Place each latency at the next free slot of its box.
+    let mut next = offsets.clone();
+    let mut values = vec![0u32; p.recs.len()];
+    for r in &p.recs {
+        let k = r.key as usize;
+        values[next[k] as usize] = r.latency;
+        next[k] += 1;
+    }
+    (offsets, values)
 }
 
-/// Process a block that ends with a line break (or is the last, partial block).
-fn process_block(block: &[u8], threads: usize, global: &mut State) {
-    // Cut points: each part starts right after a line break.
-    let mut cuts = vec![0usize];
-    for i in 1..threads {
-        let target = block.len() * i / threads;
-        let cut = match block[target..].iter().position(|&b| b == b'\n') {
-            Some(p) => target + p + 1,
-            None => block.len(),
-        };
-        if cut > *cuts.last().unwrap() {
-            cuts.push(cut);
-        }
-    }
-    cuts.push(block.len());
-
-    let locals: Vec<State> = thread::scope(|s| {
-        let handles: Vec<_> = cuts
-            .windows(2)
-            .map(|w| {
-                let part = &block[w[0]..w[1]];
-                s.spawn(move || {
-                    let mut st = State::default();
-                    for line in part.split(|&b| b == b'\n') {
-                        let line = line.strip_suffix(&[b'\r']).unwrap_or(line);
-                        if !line.is_empty() {
-                            process_line(line, &mut st);
-                        }
-                    }
-                    st
-                })
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
-    });
-
-    for local in locals {
-        absorb(global, local);
-    }
-}
-
-/// Fill `buf` as far as possible. Returns fewer bytes only at the end of input.
-fn read_full<R: Read>(r: &mut R, buf: &mut [u8]) -> io::Result<usize> {
-    let mut total = 0;
-    while total < buf.len() {
-        let n = r.read(&mut buf[total..])?;
-        if n == 0 {
-            break;
-        }
-        total += n;
-    }
-    Ok(total)
-}
-
-fn process_input<R: Read>(mut reader: R, threads: usize) -> io::Result<State> {
-    let mut global = State::default();
-    let mut chunk = vec![0u8; BLOCK];
-    let mut carry: Vec<u8> = Vec::new();
-    loop {
-        let n = read_full(&mut reader, &mut chunk)?;
-        if n == 0 {
-            if !carry.is_empty() {
-                process_block(&carry, threads, &mut global);
-            }
-            break;
-        }
-        let mut data = std::mem::take(&mut carry);
-        data.extend_from_slice(&chunk[..n]);
-        match data.iter().rposition(|&b| b == b'\n') {
-            Some(p) => {
-                carry = data[p + 1..].to_vec();
-                data.truncate(p + 1);
-                process_block(&data, threads, &mut global);
-            }
-            None => carry = data, // no full line yet: keep reading
-        }
-    }
-    Ok(global)
-}
-
-fn render(st: &mut State) -> Vec<u8> {
-    let mut order: Vec<usize> = (0..st.names.len()).collect();
-    order.sort_by(|&a, &b| st.names[a].cmp(&st.names[b]));
+/// Build the output text: one line per non-empty box, hour first, then endpoint bytes.
+fn render(p: &Parsed, offsets: &[u32], values: &mut [u32]) -> Vec<u8> {
+    // Endpoint ids in the byte order of their names.
+    let mut order: Vec<usize> = (0..p.names.len()).collect();
+    order.sort_by(|&a, &b| p.names[a].cmp(&p.names[b]));
 
     let mut out = Vec::new();
     for slot in 0..HOURS {
         for &eid in &order {
-            let group = &mut st.groups[eid * HOURS + slot];
-            if group.latencies.is_empty() {
-                continue;
+            let key = eid * HOURS + slot;
+            let start = offsets[key] as usize;
+            let end = offsets[key + 1] as usize;
+            if start == end {
+                continue; // empty box, no line
             }
-            group.latencies.sort_unstable();
-            let count = group.latencies.len() as u64;
-            let p50 = percentile(&group.latencies, 50);
-            let p95 = percentile(&group.latencies, 95);
-            let p99 = percentile(&group.latencies, 99);
-            let error_ppm = group.errors as u64 * 1_000_000 / count;
+
+            values[start..end].sort_unstable();
+            let lat: &[u32] = &values[start..end];
+
+            let count = lat.len() as u64;
+            let p50 = percentile(lat, 50);
+            let p95 = percentile(lat, 95);
+            let p99 = percentile(lat, 99);
+            let errors = p.errors[key] as u64;
+            // Error rate in parts per million, rounded down.
+            let error_ppm = errors * 1_000_000 / count;
+
             writeln!(
                 out,
                 "{}T{:02}:00:00Z {} {} {} {} {} {} {}",
                 DAYS[slot / 24],
                 slot % 24,
-                String::from_utf8_lossy(&st.names[eid]),
+                String::from_utf8_lossy(&p.names[eid]),
                 count,
                 p50,
                 p95,
                 p99,
-                group.errors,
+                errors,
                 error_ppm
             )
             .unwrap();
@@ -225,23 +163,52 @@ fn render(st: &mut State) -> Vec<u8> {
     out
 }
 
+/// Open the input as a buffered reader. "-" means standard input.
+/// The 1 MB buffer means the file is read in chunks, not all at once.
+fn open_input(path: &str) -> io::Result<Box<dyn BufRead>> {
+    if path == "-" {
+        Ok(Box::new(BufReader::with_capacity(1 << 20, io::stdin().lock())))
+    } else {
+        Ok(Box::new(BufReader::with_capacity(1 << 20, File::open(path)?)))
+    }
+}
+
 fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().collect();
     let input = args.get(1).map(String::as_str).unwrap_or("/data/requests.log");
     let output = args.get(2).map(String::as_str).unwrap_or("/out/summary.txt");
 
-    let threads = thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .clamp(1, 12);
-
-    let mut st = if input == "-" {
-        process_input(io::stdin().lock(), threads)?
-    } else {
-        process_input(File::open(input)?, threads)?
+    let mut reader = open_input(input)?;
+    let mut p = Parsed {
+        ids: HashMap::new(),
+        names: Vec::new(),
+        recs: Vec::with_capacity(3_200_000),
+        errors: Vec::new(),
     };
+    let mut line = Vec::with_capacity(256);
 
-    let out = render(&mut st);
+    loop {
+        line.clear();
+        if reader.read_until(b'\n', &mut line)? == 0 {
+            break; // end of input
+        }
+        // Remove the line ending. Some files use \r\n, so strip \r too.
+        if line.last() == Some(&b'\n') {
+            line.pop();
+        }
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
+        if !line.is_empty() {
+            process_line(&line, &mut p);
+        }
+    }
+
+    let (offsets, mut values) = group_by_box(&p);
+    // The records are no longer needed, so give their memory back.
+    p.recs = Vec::new();
+
+    let out = render(&p, &offsets, &mut values);
     if let Some(dir) = Path::new(output).parent() {
         fs::create_dir_all(dir)?;
     }
