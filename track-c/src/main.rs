@@ -73,6 +73,16 @@ impl Hasher for FxHasher {
     }
 }
 
+impl FxHasher {
+    #[inline]
+    fn hash(bytes: &[u8]) -> u64 {
+        let mut hasher = FxHasher::default();
+        hasher.write_usize(bytes.len());
+        hasher.write(bytes);
+        hasher.finish()
+    }
+}
+
 type FastMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
 
 const MAX_REGION: usize = 10_000_000;
@@ -108,12 +118,154 @@ impl Agg {
     }
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct NameSpan {
+    /// Bit 31: 0 = Input buffer slice, 1 = Worker arena slice.
+    /// Bits 0..30: Byte offset within the respective buffer.
+    tagged_offset: u32,
+    /// Byte length of the unescaped name.
+    len: u32,
+}
+
+impl NameSpan {
+    const ARENA_FLAG: u32 = 1 << 31;
+    const OFFSET_MASK: u32 = !(1 << 31);
+
+    #[inline]
+    fn from_input(offset: usize, len: usize) -> Self {
+        assert!(offset <= Self::OFFSET_MASK as usize, "Input offset exceeds 2 GB limit");
+        assert!(len <= u32::MAX as usize, "Length exceeds u32::MAX");
+        assert!(offset.checked_add(len).is_some(), "Offset + length arithmetic overflow");
+        Self {
+            tagged_offset: offset as u32,
+            len: len as u32,
+        }
+    }
+
+    #[inline]
+    fn from_arena(offset: usize, len: usize) -> Self {
+        assert!(offset <= Self::OFFSET_MASK as usize, "Arena offset exceeds 2 GB limit");
+        assert!(len <= u32::MAX as usize, "Length exceeds u32::MAX");
+        assert!(offset.checked_add(len).is_some(), "Offset + length arithmetic overflow");
+        Self {
+            tagged_offset: (offset as u32) | Self::ARENA_FLAG,
+            len: len as u32,
+        }
+    }
+
+    #[inline]
+    fn is_in_arena(&self) -> bool {
+        (self.tagged_offset & Self::ARENA_FLAG) != 0
+    }
+
+    #[inline]
+    fn offset(&self) -> usize {
+        (self.tagged_offset & Self::OFFSET_MASK) as usize
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    #[inline]
+    fn resolve<'a>(&self, input: &'a [u8], arena: &'a [u8]) -> &'a [u8] {
+        let off = self.offset();
+        let l = self.len();
+        let buf = if self.is_in_arena() { arena } else { input };
+        let end = off.checked_add(l).expect("Slice bounds arithmetic overflow");
+        assert!(end <= buf.len(), "Slice bounds exceed buffer length");
+        &buf[off..end]
+    }
+}
+
+struct NameTable {
+    mask: usize,
+    count: usize,
+    slots: Vec<u32>,
+}
+
+impl NameTable {
+    fn new(capacity: usize) -> Self {
+        assert!(capacity > 0 && capacity.is_power_of_two(), "Capacity must be a power of two");
+        NameTable {
+            mask: capacity - 1,
+            count: 0,
+            slots: vec![0u32; capacity],
+        }
+    }
+
+    #[inline]
+    fn get_or_insert(
+        &mut self,
+        name: &[u8],
+        is_escaped: bool,
+        input_offset: usize,
+        input: &[u8],
+        arena: &mut Vec<u8>,
+        names: &mut Vec<NameSpan>,
+    ) -> u32 {
+        let hash = FxHasher::hash(name);
+        let mut idx = (hash as usize) & self.mask;
+        loop {
+            let slot = self.slots[idx];
+            if slot == 0 {
+                // Ensure load factor <= 70% before adding a new entry
+                if (self.count + 1) * 10 > self.slots.len() * 7 {
+                    self.resize(input, arena, names);
+                    idx = (hash as usize) & self.mask;
+                    while self.slots[idx] != 0 {
+                        idx = (idx + 1) & self.mask;
+                    }
+                }
+                let local_id = names.len() as u32;
+                let span = if !is_escaped {
+                    NameSpan::from_input(input_offset, name.len())
+                } else {
+                    let arena_offset = arena.len();
+                    arena.extend_from_slice(name);
+                    NameSpan::from_arena(arena_offset, name.len())
+                };
+                names.push(span);
+                self.slots[idx] = local_id + 1;
+                self.count += 1;
+                return local_id;
+            }
+            let existing_id = slot - 1;
+            let existing_span = &names[existing_id as usize];
+            if existing_span.resolve(input, arena) == name {
+                return existing_id;
+            }
+            idx = (idx + 1) & self.mask;
+        }
+    }
+
+    fn resize(&mut self, input: &[u8], arena: &[u8], names: &[NameSpan]) {
+        let new_size = self.slots.len().checked_mul(2).expect("Capacity overflow");
+        let new_mask = new_size - 1;
+        let mut new_slots = vec![0u32; new_size];
+        for (lid, span) in names.iter().enumerate() {
+            let bytes = span.resolve(input, arena);
+            let hash = FxHasher::hash(bytes);
+            let mut idx = (hash as usize) & new_mask;
+            while new_slots[idx] != 0 {
+                idx = (idx + 1) & new_mask;
+            }
+            new_slots[idx] = (lid as u32) + 1;
+        }
+        self.slots = new_slots;
+        self.mask = new_mask;
+    }
+}
+
 /// Everything one thread produces.
 struct Worker {
     /// Slot index of _UNMATCHED (the last slot).
     unmatched: usize,
     aggs: Vec<Agg>,
-    name_ids: FastMap<Box<[u8]>, u32>,
+    names: Vec<NameSpan>,
+    arena: Vec<u8>,
+    table: NameTable,
     /// Holds one unescaped name at a time.
     scratch: Vec<u8>,
 }
@@ -123,7 +275,9 @@ impl Worker {
         Worker {
             unmatched: nslots - 1,
             aggs: vec![Agg::new(); nslots],
-            name_ids: FastMap::default(),
+            names: Vec::with_capacity(4096),
+            arena: Vec::with_capacity(32768),
+            table: NameTable::new(8192),
             scratch: Vec::new(),
         }
     }
@@ -161,15 +315,7 @@ fn set_bit(bits: &mut Vec<u64>, id: u32) {
     bits[word] |= 1u64 << (id % 64);
 }
 
-/// Give a name its local id, the first time it is seen.
-fn intern(ids: &mut FastMap<Box<[u8]>, u32>, name: &[u8]) -> u32 {
-    if let Some(&id) = ids.get(name) {
-        return id;
-    }
-    let id = ids.len() as u32;
-    ids.insert(name.into(), id);
-    id
-}
+
 
 /// Remove quoting from a raw value: every "" becomes one ". Raw quotes always come in pairs.
 fn unescape_into(raw: &[u8], out: &mut Vec<u8>) {
@@ -240,13 +386,13 @@ fn parse_record(d: &[u8], mut p: usize, region_map: &[u16], w: &mut Worker) -> u
     }
 
     // Name: unescape only when it has "" pairs, then give it a local id.
-    let name: &[u8] = if npairs == 0 {
-        &d[ns..ne]
+    let (name, is_escaped, input_offset) = if npairs == 0 {
+        (&d[ns..ne], false, ns)
     } else {
         unescape_into(&d[ns..ne], &mut w.scratch);
-        &w.scratch
+        (&w.scratch[..], true, 0)
     };
-    let lid = intern(&mut w.name_ids, name);
+    let lid = w.table.get_or_insert(name, is_escaped, input_offset, d, &mut w.arena, &mut w.names);
     let name_len = name.len() as u64;
 
     // Join: region -> country slot.
@@ -393,41 +539,60 @@ fn main() -> std::io::Result<()> {
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
-    // Merge the threads' results.
-    let mut global_ids: FastMap<Box<[u8]>, u32> = FastMap::default();
-    let mut next_global_id = 0u32;
+    // Move all worker arenas, name lists, and aggregates into separately owned storage before merging.
+    let mut worker_arenas: Vec<Vec<u8>> = Vec::with_capacity(workers.len());
+    let mut worker_names: Vec<Vec<NameSpan>> = Vec::with_capacity(workers.len());
+    let mut worker_aggs: Vec<Vec<Agg>> = Vec::with_capacity(workers.len());
+    for w in workers {
+        worker_arenas.push(w.arena);
+        worker_names.push(w.names);
+        worker_aggs.push(w.aggs);
+    }
+
     let mut totals: Vec<Agg> = vec![Agg::new(); nslots];
     let mut distinct_bits: Vec<Vec<u64>> = vec![Vec::new(); nslots];
-    for w in workers.into_iter() {
-        // Local name id -> global name id.
-        let mut map = vec![0u32; w.name_ids.len()];
-        for (name, local_id) in w.name_ids.into_iter() {
-            let global_id = *global_ids.entry(name).or_insert_with(|| {
-                let g = next_global_id;
-                next_global_id += 1;
-                g
-            });
-            map[local_id as usize] = global_id;
-        }
 
-        for (slot, a) in w.aggs.iter().enumerate() {
-            if a.count == 0 {
-                continue;
+    // Explicit scope ensures global_ids is dropped before its backing buffers
+    // (data and worker_arenas).
+    {
+        let mut global_ids: FastMap<&[u8], u32> = FastMap::default();
+        let mut next_global_id = 0u32;
+
+        for w_idx in 0..worker_names.len() {
+            let names = &worker_names[w_idx];
+            let arena = &worker_arenas[w_idx];
+            let aggs = &worker_aggs[w_idx];
+
+            let mut map = vec![0u32; names.len()];
+            for (local_id, span) in names.iter().enumerate() {
+                let name_bytes: &[u8] = span.resolve(data, arena);
+                let global_id = *global_ids.entry(name_bytes).or_insert_with(|| {
+                    let g = next_global_id;
+                    next_global_id += 1;
+                    g
+                });
+                map[local_id] = global_id;
             }
-            let t = &mut totals[slot];
-            t.count += a.count;
-            t.id_sum += a.id_sum;
-            t.amt_sum += a.amt_sum;
-            t.amt_min = t.amt_min.min(a.amt_min);
-            t.amt_max = t.amt_max.max(a.amt_max);
-            t.name_bytes += a.name_bytes;
-            t.note_bytes += a.note_bytes;
-            for (word_idx, &word) in a.name_bits.iter().enumerate() {
-                let mut bits = word;
-                while bits != 0 {
-                    let bit = bits.trailing_zeros() as usize;
-                    bits &= bits - 1;
-                    set_bit(&mut distinct_bits[slot], map[word_idx * 64 + bit]);
+
+            for (slot, a) in aggs.iter().enumerate() {
+                if a.count == 0 {
+                    continue;
+                }
+                let t = &mut totals[slot];
+                t.count += a.count;
+                t.id_sum += a.id_sum;
+                t.amt_sum += a.amt_sum;
+                t.amt_min = t.amt_min.min(a.amt_min);
+                t.amt_max = t.amt_max.max(a.amt_max);
+                t.name_bytes += a.name_bytes;
+                t.note_bytes += a.note_bytes;
+                for (word_idx, &word) in a.name_bits.iter().enumerate() {
+                    let mut bits = word;
+                    while bits != 0 {
+                        let bit = bits.trailing_zeros() as usize;
+                        bits &= bits - 1;
+                        set_bit(&mut distinct_bits[slot], map[word_idx * 64 + bit]);
+                    }
                 }
             }
         }
@@ -468,4 +633,94 @@ fn main() -> std::io::Result<()> {
         fs::create_dir_all(dir)?;
     }
     fs::write(output_path, out)
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_empty_names() {
+        let mut table = NameTable::new(16);
+        let mut arena = Vec::new();
+        let mut names = Vec::new();
+        let data = b"";
+
+        // Unquoted empty
+        let id1 = table.get_or_insert(b"", false, 0, data, &mut arena, &mut names);
+        // Quoted empty
+        let id2 = table.get_or_insert(b"", false, 0, data, &mut arena, &mut names);
+        assert_eq!(id1, id2);
+        assert_eq!(names.len(), 1);
+        assert_eq!(names[0].len(), 0);
+        assert_eq!(names[0].resolve(data, &arena), b"");
+    }
+
+    #[test]
+    fn test_trailing_spaces_and_escaped_quotes() {
+        let mut table = NameTable::new(16);
+        let mut arena = Vec::new();
+        let mut names = Vec::new();
+        let data = b"BettsBetts ";
+
+        let id1 = table.get_or_insert(&data[0..5], false, 0, data, &mut arena, &mut names);
+        let id2 = table.get_or_insert(&data[5..11], false, 5, data, &mut arena, &mut names);
+        assert_ne!(id1, id2);
+        assert_eq!(names[id1 as usize].resolve(data, &arena), b"Betts");
+        assert_eq!(names[id2 as usize].resolve(data, &arena), b"Betts ");
+
+        // Escaped quote
+        let unescaped = b"Ann \"Annie\" Lee";
+        let id3 = table.get_or_insert(unescaped, true, 0, data, &mut arena, &mut names);
+        assert_ne!(id1, id3);
+        assert_ne!(id2, id3);
+        assert!(names[id3 as usize].is_in_arena());
+        assert_eq!(names[id3 as usize].resolve(data, &arena), unescaped);
+
+        // Same escaped quote seen again
+        let id4 = table.get_or_insert(unescaped, true, 0, data, &mut arena, &mut names);
+        assert_eq!(id3, id4);
+        assert_eq!(arena.len(), unescaped.len()); // Arena should not duplicate
+    }
+
+    #[test]
+    fn test_table_resizing_and_collisions() {
+        let mut table = NameTable::new(16);
+        let mut arena = Vec::new();
+        let mut names = Vec::new();
+        let mut synthetic_data = Vec::new();
+
+        // Insert 1000 distinct names to trigger multiple resizes
+        for i in 0..1000 {
+            let s = format!("name_unique_{}", i);
+            let offset = synthetic_data.len();
+            synthetic_data.extend_from_slice(s.as_bytes());
+            let id = table.get_or_insert(s.as_bytes(), false, offset, &synthetic_data, &mut arena, &mut names);
+            assert_eq!(id, i as u32);
+        }
+
+        // Verify all 1000 names resolve accurately
+        for i in 0..1000 {
+            let s = format!("name_unique_{}", i);
+            let resolved = names[i].resolve(&synthetic_data, &arena);
+            assert_eq!(resolved, s.as_bytes());
+        }
+
+        assert_eq!(table.count, 1000);
+        assert!(table.slots.len() >= 2048);
+    }
+
+    #[test]
+    fn test_namespan_bounds_validation() {
+        let span_input = NameSpan::from_input(100, 50);
+        assert!(!span_input.is_in_arena());
+        assert_eq!(span_input.offset(), 100);
+        assert_eq!(span_input.len(), 50);
+
+        let span_arena = NameSpan::from_arena(200, 25);
+        assert!(span_arena.is_in_arena());
+        assert_eq!(span_arena.offset(), 200);
+        assert_eq!(span_arena.len(), 25);
+    }
 }
