@@ -203,6 +203,57 @@ fn extract_queries(raw: &[u8]) -> (Queries, FastMap<Vec<u8>, u32>) {
     (Queries { items, terms, ops, targets }, term_to_id)
 }
 
+fn extract_queries_parallel(raw: &[u8]) -> (Queries, FastMap<Vec<u8>, u32>) {
+    let nt = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2).min(4);
+    if nt < 2 || raw.len() < (1 << 16) { return extract_queries(raw); }
+
+    let mut bounds: Vec<usize> = vec![0];
+    for i in 1..nt {
+        let mut pos = (i * raw.len()) / nt;
+        let prev = *bounds.last().unwrap();
+        if pos < prev { pos = prev; }
+        pos = match find_byte(&raw[pos..], b'\n') { Some(p) => pos + p + 1, None => raw.len() };
+        bounds.push(pos);
+    }
+    bounds.push(raw.len());
+
+    let parts: Vec<(Queries, FastMap<Vec<u8>, u32>)> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..nt).map(|i| {
+            let c = &raw[bounds[i]..bounds[i + 1]];
+            s.spawn(move || extract_queries(c))
+        }).collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    let mut it = parts.into_iter();
+    let (q0, mut global) = it.next().unwrap();
+    let Queries { mut items, mut terms, mut ops, mut targets } = q0;
+
+    for (q, map) in it {
+        let mut remap: Vec<u32> = vec![0; map.len()];
+        for (term, lid) in map {
+            let gid = match global.get(term.as_slice()) {
+                Some(&g) => g,
+                None => { let g = global.len() as u32; global.insert(term, g); g }
+            };
+            remap[lid as usize] = gid;
+        }
+        let t_base = terms.len() as u32;
+        let o_base = ops.len() as u32;
+        let g_base = targets.len() as u32;
+        terms.extend(q.terms.iter().map(|&t| remap[t as usize]));
+        ops.extend_from_slice(&q.ops);
+        targets.extend_from_slice(&q.targets);
+        items.extend(q.items.iter().map(|it| Query {
+            t_off: it.t_off + t_base,
+            o_off: it.o_off + o_base,
+            g_off: it.g_off + g_base,
+            ..*it
+        }));
+    }
+    (Queries { items, terms, ops, targets }, global)
+}
+
 struct InvertedIndex {
     doc_ids: Vec<u32>,
     offsets: Vec<u32>,
@@ -574,45 +625,111 @@ fn difference(mut a: &[u32], mut b: &[u32], out: &mut Vec<u32>) {
     if !a.is_empty() { out.extend_from_slice(a); }
 }
 
+#[inline(always)]
+fn apply(op: Op, a: &[u32], b: &[u32], out: &mut Vec<u32>) {
+    match op {
+        Op::And => intersect(a, b, out),
+        Op::Or  => union(a, b, out),
+        Op::Not => difference(a, b, out),
+    }
+}
+
+#[inline(always)]
+fn step(state: &mut u8, base: &[u32], op: Op, p: &[u32], buf_a: &mut Vec<u32>, buf_b: &mut Vec<u32>) {
+    match *state {
+        0 => { apply(op, base, p, buf_a); *state = 1; }
+        1 => { apply(op, &buf_a[..], p, buf_b); *state = 2; }
+        _ => { apply(op, &buf_b[..], p, buf_a); *state = 1; }
+    }
+}
+
+#[inline(always)]
+fn cur_len(state: u8, base: &[u32], buf_a: &Vec<u32>, buf_b: &Vec<u32>) -> usize {
+    match state { 0 => base.len(), 1 => buf_a.len(), _ => buf_b.len() }
+}
+
 fn run_bool<'a>(
     index: &'a InvertedIndex, terms: &[u32], ops: &[Op],
-    buf_a: &'a mut Vec<u32>, buf_b: &'a mut Vec<u32>,
+    buf_a: &'a mut Vec<u32>, buf_b: &'a mut Vec<u32>, scratch: &mut Vec<(usize, u32)>,
 ) -> &'a [u32] {
-    let first = index.get(terms[0]);
-    if ops.is_empty() { return first; }
-    buf_a.clear(); buf_a.extend_from_slice(first);
-    let mut in_a = true;
-    for (op, &tid) in ops.iter().zip(terms[1..].iter()) {
-        let p = index.get(tid);
-        match op {
-            Op::And => { if in_a { if buf_a.is_empty() { continue; } intersect(buf_a, p, buf_b); in_a=false; }
-                         else    { if buf_b.is_empty() { continue; } intersect(buf_b, p, buf_a); in_a=true;  } }
-            Op::Or  => { if in_a { union(buf_a, p, buf_b); in_a=false; }
-                         else    { union(buf_b, p, buf_a); in_a=true;  } }
-            Op::Not => { if in_a { if buf_a.is_empty() { continue; } difference(buf_a, p, buf_b); in_a=false; }
-                         else    { if buf_b.is_empty() { continue; } difference(buf_b, p, buf_a); in_a=true;  } }
+    let n = ops.len();
+    if n == 0 { return index.get(terms[0]); }
+
+    let f = ops.iter().position(|&o| o == Op::Or).unwrap_or(n);
+
+    scratch.clear();
+    scratch.push((index.get(terms[0]).len(), terms[0]));
+    for j in 0..f {
+        if ops[j] == Op::And {
+            let t = terms[j + 1];
+            scratch.push((index.get(t).len(), t));
         }
     }
-    if in_a { buf_a } else { buf_b }
+    scratch.sort_unstable();
+
+    let mut state: u8 = 0;
+    let base: &[u32] = index.get(scratch[0].1);
+    for idx in 1..scratch.len() {
+        if cur_len(state, base, buf_a, buf_b) == 0 { break; }
+        step(&mut state, base, Op::And, index.get(scratch[idx].1), buf_a, buf_b);
+    }
+    for j in 0..f {
+        if ops[j] == Op::Not {
+            if cur_len(state, base, buf_a, buf_b) == 0 { break; }
+            step(&mut state, base, Op::Not, index.get(terms[j + 1]), buf_a, buf_b);
+        }
+    }
+
+    let mut k = f;
+    while k < n {
+        step(&mut state, base, Op::Or, index.get(terms[k + 1]), buf_a, buf_b);
+        k += 1;
+        let mut e = k;
+        while e < n && ops[e] != Op::Or { e += 1; }
+        if e > k {
+            scratch.clear();
+            for j in k..e {
+                if ops[j] == Op::And {
+                    let t = terms[j + 1];
+                    scratch.push((index.get(t).len(), t));
+                }
+            }
+            scratch.sort_unstable();
+            for idx in 0..scratch.len() {
+                if cur_len(state, base, buf_a, buf_b) == 0 { break; }
+                step(&mut state, base, Op::And, index.get(scratch[idx].1), buf_a, buf_b);
+            }
+            for j in k..e {
+                if ops[j] == Op::Not {
+                    if cur_len(state, base, buf_a, buf_b) == 0 { break; }
+                    step(&mut state, base, Op::Not, index.get(terms[j + 1]), buf_a, buf_b);
+                }
+            }
+            k = e;
+        }
+    }
+
+    match state { 0 => base, 1 => &buf_a[..], _ => &buf_b[..] }
 }
 
 fn run_phrase(
     index: &InvertedIndex, doc_store: &DocStore, terms: &[u32], target: &[u8],
     buf_a: &mut Vec<u32>, buf_b: &mut Vec<u32>, matches: &mut Vec<u32>,
     toks: &mut Vec<(u32, u32)>, words: &mut Vec<(u32, u32)>,
-) {
+) -> (usize, u64) {
     matches.clear();
     let first = index.get(terms[0]);
-    if first.is_empty() { return; }
+    if first.is_empty() { return (0, 0); }
     buf_a.clear(); buf_a.extend_from_slice(first);
     let mut in_a = true;
     for &tid in &terms[1..] {
         let p = index.get(tid);
-        if in_a { if buf_a.is_empty() { return; } intersect(buf_a, p, buf_b); in_a=false; }
-        else    { if buf_b.is_empty() { return; } intersect(buf_b, p, buf_a); in_a=true;  }
+        if in_a { if buf_a.is_empty() { return (0, 0); } intersect(buf_a, p, buf_b); in_a=false; }
+        else    { if buf_b.is_empty() { return (0, 0); } intersect(buf_b, p, buf_a); in_a=true;  }
     }
     let candidates = if in_a { buf_a.as_slice() } else { buf_b.as_slice() };
-    if candidates.is_empty() { return; }
+    if candidates.is_empty() { return (0, 0); }
+    let tv = std::time::Instant::now();
     words.clear();
     let n = target.len();
     let mut i = 0;
@@ -625,6 +742,7 @@ fn run_phrase(
     for &doc_id in candidates {
         if doc_store.has_phrase(doc_id, target, words, toks) { matches.push(doc_id); }
     }
+    (candidates.len(), tv.elapsed().as_nanos() as u64)
 }
 
 fn format_result<W: Write>(writer: &mut W, ids: &[u32]) {
@@ -667,7 +785,7 @@ fn main() {
     let docs_path = data_path.join(DOCS_FILE);
     let reader = std::thread::spawn(move || read_docs(&docs_path));
 
-    let (mut queries, term_to_id) = extract_queries(&qraw);
+    let (mut queries, term_to_id) = extract_queries_parallel(&qraw);
     let t_queries = t0.elapsed();
 
     let t1 = std::time::Instant::now();
@@ -704,7 +822,7 @@ fn main() {
     let index_ref     = &index;
     let doc_store_ref = &doc_store;
 
-    let rendered: Vec<Vec<u8>> = std::thread::scope(|s| {
+    let rendered: Vec<(Vec<u8>, [u64; 8])> = std::thread::scope(|s| {
         let handles: Vec<_> = query_chunks.into_iter().map(|chunk| {
             s.spawn(move || {
                 let mut out = Vec::with_capacity(chunk.len() * 32);
@@ -713,27 +831,46 @@ fn main() {
                 let mut pm:    Vec<u32> = Vec::new();
                 let mut toks: Vec<(u32, u32)> = Vec::new();
                 let mut words: Vec<(u32, u32)> = Vec::new();
+                let mut scratch: Vec<(usize, u32)> = Vec::new();
+                let mut st = [0u64; 8];
                 for q in chunk {
+                    let tq = std::time::Instant::now();
                     let terms = &terms_ref[q.t_off as usize..(q.t_off + q.t_len) as usize];
                     if q.phrase {
                         let target = &targets_ref[q.g_off as usize..(q.g_off + q.g_len) as usize];
-                        run_phrase(index_ref, doc_store_ref, terms, target, &mut buf_a, &mut buf_b, &mut pm, &mut toks, &mut words);
+                        let (cand, vns) = run_phrase(index_ref, doc_store_ref, terms, target, &mut buf_a, &mut buf_b, &mut pm, &mut toks, &mut words);
                         format_result(&mut out, &pm);
+                        st[1] += tq.elapsed().as_nanos() as u64;
+                        st[3] += 1;
+                        st[4] += cand as u64;
+                        st[7] += vns;
                     } else {
                         let ops = &ops_ref[q.o_off as usize..(q.o_off + q.t_len - 1) as usize];
-                        let r = run_bool(index_ref, terms, ops, &mut buf_a, &mut buf_b);
+                        let r = run_bool(index_ref, terms, ops, &mut buf_a, &mut buf_b, &mut scratch);
                         format_result(&mut out, r);
+                        st[0] += tq.elapsed().as_nanos() as u64;
+                        st[2] += 1;
+                        st[5] += terms.iter().map(|&t| index_ref.get(t).len() as u64).sum::<u64>();
+                        st[6] += r.len() as u64;
                     }
                 }
-                out
+                (out, st)
             })
         }).collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
     let eval_dur = t_eval.elapsed();
-    for buf in rendered { writer.write_all(&buf).expect("write"); }
+    let t_write = std::time::Instant::now();
+    let mut tot = [0u64; 8];
+    for (buf, st) in rendered {
+        for k in 0..8 { tot[k] += st[k]; }
+        writer.write_all(&buf).expect("write");
+    }
     writer.flush().expect("flush");
+    let write_dur = t_write.elapsed();
+    eprintln!("[PROFILE5] BOOL: {} queries, {} thread-ms, input elems {}, result elems {} | PHRASE: {} queries, {} thread-ms (verify {} thread-ms), candidates {} | results write: {:?}",
+        tot[2], tot[0] / 1_000_000, tot[5], tot[6], tot[3], tot[1] / 1_000_000, tot[7] / 1_000_000, tot[4], write_dur);
 
     eprintln!("[PROFILE2] Queries file read: {:?} | Distinct terms: {} | Queries: {}", t_qread, term_to_id.len(), queries.items.len());
     eprintln!("[PROFILE] Queries parse: {:?} | Docs read wait: {:?} | Corpus index: {:?} | Parallel query eval: {:?}",
