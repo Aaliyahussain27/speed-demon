@@ -5,6 +5,30 @@ use std::fs::File;
 use std::io::{BufWriter, Read, Write};
 use std::path::Path;
 
+static THREAD_CAP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn hw_threads() -> usize {
+    let n = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let c = THREAD_CAP.load(std::sync::atomic::Ordering::Relaxed);
+    if c > 0 { n.min(c) } else { n }
+}
+
+#[repr(C)]
+struct Timespec {
+    tv_sec: i64,
+    tv_nsec: i64,
+}
+
+unsafe extern "C" {
+    fn clock_gettime(clk_id: i32, tp: *mut Timespec) -> i32;
+}
+
+fn cpu_ns() -> u64 {
+    let mut ts = Timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe { clock_gettime(2, &mut ts); }
+    (ts.tv_sec as u64) * 1_000_000_000 + ts.tv_nsec as u64
+}
+
 const DOCS_FILE: &str = "docs.txt";
 const QUERIES_FILE: &str = "queries.txt";
 const RESULTS_FILE: &str = "results.txt";
@@ -204,7 +228,7 @@ fn extract_queries(raw: &[u8]) -> (Queries, FastMap<Vec<u8>, u32>) {
 }
 
 fn extract_queries_parallel(raw: &[u8]) -> (Queries, FastMap<Vec<u8>, u32>) {
-    let nt = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2).min(4);
+    let nt = hw_threads().min(4);
     if nt < 2 || raw.len() < (1 << 16) { return extract_queries(raw); }
 
     let mut bounds: Vec<usize> = vec![0];
@@ -267,42 +291,28 @@ impl InvertedIndex {
     }
 }
 
+const NONE_TOK: u32 = u32::MAX;
+
 struct DocStore {
-    raw: Vec<u8>,
-    spans: Vec<Vec<(u32, u32)>>,
+    streams: Vec<Vec<u32>>,
+    offs: Vec<Vec<u32>>,
     starts: Vec<u32>,
-    trans: [u8; 256],
 }
 impl DocStore {
-    fn has_phrase(&self, id: u32, target: &[u8], words: &[(u32, u32)], toks: &mut Vec<(u32, u32)>) -> bool {
+    #[inline(always)]
+    fn has_phrase(&self, id: u32, ids: &[u32]) -> bool {
         let ci = self.starts.partition_point(|&s| s <= id) - 1;
-        let (s, e) = self.spans[ci][(id - self.starts[ci]) as usize];
-        let text = &self.raw[s as usize..e as usize];
-        let k = words.len();
-        toks.clear();
-        let mut start = usize::MAX;
-        for (i, &b) in text.iter().enumerate() {
-            if self.trans[b as usize] != b' ' {
-                if start == usize::MAX { start = i; }
-            } else if start != usize::MAX {
-                toks.push((start as u32, i as u32));
-                start = usize::MAX;
-            }
-        }
-        if start != usize::MAX { toks.push((start as u32, text.len() as u32)); }
+        let l = (id - self.starts[ci]) as usize;
+        let off = &self.offs[ci];
+        let toks = &self.streams[ci][off[l] as usize..off[l + 1] as usize];
+        let k = ids.len();
         if toks.len() < k { return false; }
-        'outer: for i in 0..=toks.len() - k {
-            for j in 0..k {
-                let (a, b) = toks[i + j];
-                let (wa, wb) = words[j];
-                let w = &target[wa as usize..wb as usize];
-                if (b - a) as usize != w.len() { continue 'outer; }
-                let t = &text[a as usize..b as usize];
-                for (x, &y) in t.iter().zip(w.iter()) {
-                    if self.trans[*x as usize] != y { continue 'outer; }
-                }
-            }
-            return true;
+        let first = ids[0];
+        let last_start = toks.len() - k;
+        let mut i = 0;
+        while i <= last_start {
+            if toks[i] == first && toks[i + 1..i + k] == ids[1..] { return true; }
+            i += 1;
         }
         false
     }
@@ -417,7 +427,8 @@ fn read_docs(path: &Path) -> Vec<u8> {
     let len = f.metadata().expect("stat docs.txt").len() as usize;
     let mut raw: Vec<u8> = vec![0u8; len];
     if len > 0 {
-        let per = ((len + 3) / 4).max(1);
+        let readers = hw_threads().min(4);
+        let per = ((len + readers - 1) / readers).max(1);
         std::thread::scope(|s| {
             for (i, chunk) in raw.chunks_mut(per).enumerate() {
                 let f = &f;
@@ -442,7 +453,7 @@ fn read_docs(path: &Path) -> Vec<u8> {
 fn load_corpus(raw: Vec<u8>, term_ids: &TermTable) -> (DocStore, InvertedIndex) {
 
     let trans_table = build_trans_table();
-    let nthreads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(8);
+    let nthreads = hw_threads().min(8);
     let n_terms = term_ids.len();
 
     let mut byte_starts: Vec<usize> = vec![0];
@@ -456,7 +467,7 @@ fn load_corpus(raw: Vec<u8>, term_ids: &TermTable) -> (DocStore, InvertedIndex) 
 
     assert!(raw.len() < u32::MAX as usize);
 
-    type PassA = (Vec<(u32, u32)>, Vec<u32>);
+    type PassA = (Vec<u32>, Vec<u32>, Vec<u32>);
 
     let pass_a: Vec<PassA> = std::thread::scope(|s| {
         let raw_ref      = &raw[..];
@@ -471,14 +482,13 @@ fn load_corpus(raw: Vec<u8>, term_ids: &TermTable) -> (DocStore, InvertedIndex) 
                 let chunk = &raw_ref[bstart..bend];
                 let mut counts: Vec<u32> = vec![0; n_terms];
                 let mut last: Vec<u32> = vec![u32::MAX; n_terms];
-                let mut spans: Vec<(u32, u32)> = Vec::with_capacity(chunk.len() / 40);
+                let mut stream: Vec<u32> = Vec::with_capacity(chunk.len() / 6 + 16);
+                let mut offs: Vec<u32> = Vec::with_capacity(chunk.len() / 200 + 16);
                 let mut tok: Vec<u8> = Vec::with_capacity(64);
                 let mut doc_id: u32 = 0;
-                let mut pos = 0usize;
+                offs.push(0);
 
                 for line in chunk.split(|&b| b == b'\n') {
-                    let line_off = pos;
-                    pos += line.len() + 1;
                     let line = if line.ends_with(b"\r") { &line[..line.len()-1] } else { line };
                     if line.is_empty() { continue; }
 
@@ -488,35 +498,46 @@ fn load_corpus(raw: Vec<u8>, term_ids: &TermTable) -> (DocStore, InvertedIndex) 
                     };
                     let text = &line[ts..];
 
+                    let mut prev_none = false;
                     for_each_token(text, &trans_table, &mut tok, |t| {
-                        if let Some(tid) = term_ids_ref.get(t) {
-                            let tid = tid as usize;
-                            if last[tid] != doc_id { last[tid] = doc_id; counts[tid] += 1; }
+                        match term_ids_ref.get(t) {
+                            Some(tid) => {
+                                prev_none = false;
+                                stream.push(tid);
+                                let u = tid as usize;
+                                if last[u] != doc_id { last[u] = doc_id; counts[u] += 1; }
+                            }
+                            None => {
+                                if !prev_none { stream.push(NONE_TOK); prev_none = true; }
+                            }
                         }
                     });
 
-                    let st = (bstart + line_off + ts) as u32;
-                    spans.push((st, st + text.len() as u32));
+                    offs.push(stream.len() as u32);
                     doc_id += 1;
                 }
-                (spans, counts)
+                (counts, stream, offs)
             }));
         }
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
-    let mut span_sets: Vec<Vec<(u32, u32)>> = Vec::with_capacity(nthreads);
+    drop(raw);
+
+    let mut streams: Vec<Vec<u32>> = Vec::with_capacity(nthreads);
+    let mut offs_all: Vec<Vec<u32>> = Vec::with_capacity(nthreads);
     let mut counts_all: Vec<Vec<u32>> = Vec::with_capacity(nthreads);
-    for (spans, counts) in pass_a {
-        span_sets.push(spans);
+    for (counts, stream, offs) in pass_a {
         counts_all.push(counts);
+        streams.push(stream);
+        offs_all.push(offs);
     }
 
     let mut doc_id_starts: Vec<u32> = Vec::with_capacity(nthreads + 1);
     let mut cumulative: u32 = 0;
     doc_id_starts.push(0);
-    for spans in &span_sets {
-        cumulative += spans.len() as u32;
+    for offs in &offs_all {
+        cumulative += (offs.len() - 1) as u32;
         doc_id_starts.push(cumulative);
     }
 
@@ -542,38 +563,33 @@ fn load_corpus(raw: Vec<u8>, term_ids: &TermTable) -> (DocStore, InvertedIndex) 
     let out = SharedOut(doc_ids.as_mut_ptr(), doc_ids.len());
 
     std::thread::scope(|s| {
-        let raw_ref      = &raw[..];
-        let term_ids_ref = term_ids;
-
         for (i, cursor) in cursors.iter_mut().enumerate() {
-            let spans_i = &span_sets[i];
-            let base    = doc_id_starts[i];
+            let stream = &streams[i];
+            let offs   = &offs_all[i];
+            let base   = doc_id_starts[i];
 
             s.spawn(move || {
                 let mut last: Vec<u32> = vec![u32::MAX; n_terms];
-                let mut tok: Vec<u8> = Vec::with_capacity(64);
+                let nd = offs.len() - 1;
 
-                for (local, &(st, en)) in spans_i.iter().enumerate() {
-                    let local = local as u32;
-                    let gid = base + local;
-                    let text = &raw_ref[st as usize..en as usize];
-
-                    for_each_token(text, &trans_table, &mut tok, |t| {
-                        if let Some(tid) = term_ids_ref.get(t) {
-                            let tid = tid as usize;
-                            if last[tid] != local {
-                                last[tid] = local;
-                                out.write(cursor[tid] as usize, gid);
-                                cursor[tid] += 1;
-                            }
+                for local in 0..nd {
+                    let l = local as u32;
+                    let gid = base + l;
+                    for &tid in &stream[offs[local] as usize..offs[local + 1] as usize] {
+                        if tid == NONE_TOK { continue; }
+                        let u = tid as usize;
+                        if last[u] != l {
+                            last[u] = l;
+                            out.write(cursor[u] as usize, gid);
+                            cursor[u] += 1;
                         }
-                    });
+                    }
                 }
             });
         }
     });
 
-    (DocStore { raw, spans: span_sets, starts: doc_id_starts, trans: trans_table },
+    (DocStore { streams, offs: offs_all, starts: doc_id_starts },
      InvertedIndex { doc_ids, offsets: inv_offsets })
 }
 
@@ -713,16 +729,19 @@ fn run_bool<'a>(
 }
 
 fn run_phrase(
-    index: &InvertedIndex, doc_store: &DocStore, terms: &[u32], target: &[u8],
+    index: &InvertedIndex, doc_store: &DocStore, terms: &[u32],
     buf_a: &mut Vec<u32>, buf_b: &mut Vec<u32>, matches: &mut Vec<u32>,
-    toks: &mut Vec<(u32, u32)>, words: &mut Vec<(u32, u32)>,
+    order: &mut Vec<u32>,
 ) -> (usize, u64) {
     matches.clear();
-    let first = index.get(terms[0]);
+    order.clear();
+    order.extend_from_slice(terms);
+    order.sort_unstable_by_key(|&x| index.get(x).len());
+    let first = index.get(order[0]);
     if first.is_empty() { return (0, 0); }
     buf_a.clear(); buf_a.extend_from_slice(first);
     let mut in_a = true;
-    for &tid in &terms[1..] {
+    for &tid in &order[1..] {
         let p = index.get(tid);
         if in_a { if buf_a.is_empty() { return (0, 0); } intersect(buf_a, p, buf_b); in_a=false; }
         else    { if buf_b.is_empty() { return (0, 0); } intersect(buf_b, p, buf_a); in_a=true;  }
@@ -730,17 +749,8 @@ fn run_phrase(
     let candidates = if in_a { buf_a.as_slice() } else { buf_b.as_slice() };
     if candidates.is_empty() { return (0, 0); }
     let tv = std::time::Instant::now();
-    words.clear();
-    let n = target.len();
-    let mut i = 0;
-    while i < n {
-        if target[i] == b' ' { i += 1; continue; }
-        let st = i;
-        while i < n && target[i] != b' ' { i += 1; }
-        words.push((st as u32, i as u32));
-    }
     for &doc_id in candidates {
-        if doc_store.has_phrase(doc_id, target, words, toks) { matches.push(doc_id); }
+        if doc_store.has_phrase(doc_id, terms) { matches.push(doc_id); }
     }
     (candidates.len(), tv.elapsed().as_nanos() as u64)
 }
@@ -764,6 +774,26 @@ fn peak_rss_mb() -> u64 {
     0
 }
 
+fn cpu_seconds() -> f64 {
+    let s = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
+    let after = match s.rfind(')') { Some(p) => &s[p + 1..], None => return 0.0 };
+    let f: Vec<&str> = after.split_whitespace().collect();
+    if f.len() < 13 { return 0.0; }
+    let ut: f64 = f[11].parse().unwrap_or(0.0);
+    let st: f64 = f[12].parse().unwrap_or(0.0);
+    (ut + st) / 100.0
+}
+
+fn vm_peak_mb() -> u64 {
+    let s = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    for l in s.lines() {
+        if let Some(r) = l.strip_prefix("VmPeak:") {
+            return r.trim().trim_end_matches("kB").trim().parse::<u64>().unwrap_or(0) / 1024;
+        }
+    }
+    0
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     let mut data_dir = "/data".to_string();
@@ -776,8 +806,14 @@ fn main() {
     }
 
     let data_path = Path::new(&data_dir);
+    if let Ok(txt) = std::fs::read_to_string(Path::new(&data_dir).join("threads.txt")) {
+        if let Ok(v) = txt.trim().parse::<usize>() {
+            THREAD_CAP.store(v, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
     let out_path  = Path::new(&out_dir);
 
+    let c0 = cpu_ns();
     let t0 = std::time::Instant::now();
     let qraw = read_queries(&data_path.join(QUERIES_FILE));
     let t_qread = t0.elapsed();
@@ -785,8 +821,9 @@ fn main() {
     let docs_path = data_path.join(DOCS_FILE);
     let reader = std::thread::spawn(move || read_docs(&docs_path));
 
-    let (mut queries, term_to_id) = extract_queries_parallel(&qraw);
+    let (queries, term_to_id) = extract_queries_parallel(&qraw);
     let t_queries = t0.elapsed();
+    let c1 = cpu_ns();
 
     let t1 = std::time::Instant::now();
     let raw = reader.join().expect("docs reader");
@@ -796,27 +833,17 @@ fn main() {
     let term_table = TermTable::from_map(&term_to_id);
     let (doc_store, index) = load_corpus(raw, &term_table);
     let t_corpus = t2.elapsed();
-
-    {
-        let Queries { items, terms, .. } = &mut queries;
-        for q in items.iter() {
-            if q.phrase {
-                let t = &mut terms[q.t_off as usize..(q.t_off + q.t_len) as usize];
-                t.sort_unstable_by_key(|&x| index.get(x).len());
-            }
-        }
-    }
+    let c2 = cpu_ns();
 
     std::fs::create_dir_all(out_path).expect("create out dir");
     let out_file = File::create(out_path.join(RESULTS_FILE)).expect("create results.txt");
     let mut writer = BufWriter::new(out_file);
 
-    let nthreads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(8);
+    let nthreads = hw_threads().min(8);
     let chunk_size = (queries.items.len() + nthreads - 1) / nthreads;
     let query_chunks: Vec<&[Query]> = queries.items.chunks(chunk_size).collect();
     let terms_ref: &[u32] = &queries.terms;
     let ops_ref: &[Op] = &queries.ops;
-    let targets_ref: &[u8] = &queries.targets;
 
     let t_eval = std::time::Instant::now();
     let index_ref     = &index;
@@ -829,16 +856,14 @@ fn main() {
                 let mut buf_a: Vec<u32> = Vec::new();
                 let mut buf_b: Vec<u32> = Vec::new();
                 let mut pm:    Vec<u32> = Vec::new();
-                let mut toks: Vec<(u32, u32)> = Vec::new();
-                let mut words: Vec<(u32, u32)> = Vec::new();
+                let mut order: Vec<u32> = Vec::new();
                 let mut scratch: Vec<(usize, u32)> = Vec::new();
                 let mut st = [0u64; 8];
                 for q in chunk {
                     let tq = std::time::Instant::now();
                     let terms = &terms_ref[q.t_off as usize..(q.t_off + q.t_len) as usize];
                     if q.phrase {
-                        let target = &targets_ref[q.g_off as usize..(q.g_off + q.g_len) as usize];
-                        let (cand, vns) = run_phrase(index_ref, doc_store_ref, terms, target, &mut buf_a, &mut buf_b, &mut pm, &mut toks, &mut words);
+                        let (cand, vns) = run_phrase(index_ref, doc_store_ref, terms, &mut buf_a, &mut buf_b, &mut pm, &mut order);
                         format_result(&mut out, &pm);
                         st[1] += tq.elapsed().as_nanos() as u64;
                         st[3] += 1;
@@ -861,6 +886,7 @@ fn main() {
     });
 
     let eval_dur = t_eval.elapsed();
+    let c3 = cpu_ns();
     let t_write = std::time::Instant::now();
     let mut tot = [0u64; 8];
     for (buf, st) in rendered {
@@ -876,4 +902,8 @@ fn main() {
     eprintln!("[PROFILE] Queries parse: {:?} | Docs read wait: {:?} | Corpus index: {:?} | Parallel query eval: {:?}",
         t_queries, t_wait, t_corpus, eval_dur);
     eprintln!("[PROFILE3] Peak RSS: {} MB", peak_rss_mb());
+    eprintln!("[PROFILE7] CPU ms: queries+docs read {} | corpus {} | eval {} | total {} | threads {}",
+        (c1 - c0) / 1_000_000, (c2 - c1) / 1_000_000, (c3 - c2) / 1_000_000, (c3 - c0) / 1_000_000, hw_threads());
+    eprintln!("[PROFILE6] CPU time user+sys: {:.2} s | VmPeak: {} MB | cpus visible: {}",
+        cpu_seconds(), vm_peak_mb(), hw_threads());
 }
