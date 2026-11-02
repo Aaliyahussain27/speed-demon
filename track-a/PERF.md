@@ -10,4 +10,4 @@ Every step from the reference to your final version, each with the live-board ru
 | 3 | Replace the standard HashMap hash for endpoint names with FNV-1a (no crates). Build settings: LTO, codegen-units = 1, panic = abort. | run-d4ab6d5944c2 |0.804292 |47419392 |42.971933 |
 | 4 | Flat-array version: records, counting sort into one array, sort each box's slice. Standard HashMap|run-3ab31b743f43 |0.671268 |41668608 |45.514196 |
 | 5 |Parallel 4 MB blocks, per-thread tables merged (this version) |run-c92afe7849b0 | 0.779689 |147746816|37.744356 |
-| 6 | 	PGO on the best base| | | | |
+| 6 | PGO on the best base| |0.641 | 42|45.990 |
